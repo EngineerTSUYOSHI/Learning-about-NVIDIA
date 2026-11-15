@@ -10,7 +10,7 @@ import torch
 from isaaclab.managers import ManagerTermBase, TerminationTermCfg
 
 from .progress import ball_lift_progress
-from .task import BALL_LIFT_TARGET_HEIGHT, ball_height, ball_is_holding, contact_force
+from .task import BALL_LIFT_MIN_HEIGHT, BALL_LIFT_TARGET_HEIGHT, ball_height, ball_is_holding, contact_force
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -59,8 +59,12 @@ class ball_lift_success(ManagerTermBase):
         return success
 
 
-def ball_dropped(env: ManagerBasedRLEnv, height_above_robot: float = 0.004) -> torch.Tensor:
-    """一度持ち上げたボールが机に落下した場合に終了判定を返す。"""
-    robot_height = env.scene["robot"].data.root_link_pos_w.torch[:, 2]
-    fallen = env.scene["ball"].data.root_pos_w.torch[:, 2] - robot_height < height_above_robot
+def ball_dropped(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """一度目標高さまで持ち上げたボールが机（マット）の上まで落ちた場合に終了判定を返す。
+
+    以前はロボット根元（z≈0）との比較だったため、机上（ボール中心 z≈0.055）への落下では発火しなかった。
+    机上で静止しているとみなす高さ（``BALL_LIFT_MIN_HEIGHT`` 未満）まで戻ったら落下とする。
+    """
+    support_height = getattr(env, "_so101_support_height", 0.0)
+    fallen = ball_height(env) < BALL_LIFT_MIN_HEIGHT + support_height
     return ball_lift_progress(env).lifted & fallen

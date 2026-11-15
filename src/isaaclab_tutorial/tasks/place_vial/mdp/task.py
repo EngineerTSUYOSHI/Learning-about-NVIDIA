@@ -31,9 +31,26 @@ def contact_force(env: ManagerBasedRLEnv, sensor_name: str) -> torch.Tensor:
     return torch.linalg.vector_norm(forces.torch, dim=-1).reshape(env.num_envs, -1).amax(dim=-1)
 
 
+def fixed_jaw_ball_force(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """固定爪（gripperリンク）が机・マット以外から受けている接触力 [N] を返す。
+
+    ``fixed_jaw_contact`` はOV PhysXの制約でフィルタ無し（全接触の合力）のため、そのままだと机に触れただけで
+    「ボールに接触」と誤判定する。机・マットにフィルタした ``fixed_jaw_support`` の力ベクトルを差し引いて、
+    机以外（＝ボール）との接触力を推定する。
+    """
+    sensor = env.scene.sensors["fixed_jaw_contact"]
+    if sensor.cfg.filter_prim_paths_expr:
+        return contact_force(env, "fixed_jaw_contact")
+    net = sensor.data.net_forces_w.torch.reshape(env.num_envs, -1, 3).sum(dim=1)
+    if "fixed_jaw_support" in env.scene.sensors:
+        support = env.scene.sensors["fixed_jaw_support"].data.force_matrix_w.torch
+        net = net - support.reshape(env.num_envs, -1, 3).sum(dim=1)
+    return torch.linalg.vector_norm(net, dim=-1)
+
+
 def jaw_contacts(env: ManagerBasedRLEnv, threshold: float = 0.05) -> tuple[torch.Tensor, torch.Tensor]:
-    """固定爪・可動爪それぞれがボールに接触しているかを返す。"""
-    return contact_force(env, "fixed_jaw_contact") > threshold, contact_force(env, "moving_jaw_contact") > threshold
+    """固定爪・可動爪それぞれがボールに接触しているかを返す（固定爪は机との接触分を除外）。"""
+    return fixed_jaw_ball_force(env) > threshold, contact_force(env, "moving_jaw_contact") > threshold
 
 
 def fingertip_positions_w(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Tensor]:
