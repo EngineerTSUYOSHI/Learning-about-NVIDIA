@@ -18,8 +18,8 @@ BALL_REST_HEIGHT = 0.035 + BALL_RADIUS
 """35mmの机の上に静止しているボールの中心の高さ [m]"""
 BALL_LIFT_TARGET_HEIGHT = 0.120
 """STEP 1の成功判定となる目標持ち上げ高さ [m]（机から約6.5cm上空）"""
-BALL_LIFT_MIN_HEIGHT = BALL_REST_HEIGHT + 0.010
-"""机から確実に浮いていると判定する最小クリアランス高さ [m]（机+1cm）"""
+BALL_LIFT_MIN_HEIGHT = BALL_REST_HEIGHT + 0.004
+"""机から浮いていると判定する最小クリアランス高さ [m]（静止高さ+4mm）"""
 FIXED_FINGERTIP_OFFSET = (-0.01289, -0.00022, -0.0986)
 MOVING_FINGERTIP_OFFSET = (-0.0068, -0.0766, 0.0189)
 
@@ -61,6 +61,13 @@ def ball_grasp_point_w(env: ManagerBasedRLEnv) -> torch.Tensor:
 def ball_height(env: ManagerBasedRLEnv) -> torch.Tensor:
     """環境原点に対するボール中心の高さ [m] を返す。"""
     return env.scene["ball"].data.root_pos_w.torch[:, 2] - env.scene.env_origins[:, 2]
+
+
+def ball_in_jaws(env: ManagerBasedRLEnv, max_distance: float = 0.025) -> torch.Tensor:
+    """両爪の中心付近（``max_distance`` [m] 以内）にボールがあり、かつ両爪がボールに接触している場合に True を返す。"""
+    fixed, moving = jaw_contacts(env)
+    centered = torch.linalg.vector_norm(grasp_center_w(env) - ball_grasp_point_w(env), dim=-1) < max_distance
+    return fixed & moving & centered
 
 
 def ball_is_holding(env: ManagerBasedRLEnv) -> torch.Tensor:
