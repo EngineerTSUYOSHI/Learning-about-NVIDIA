@@ -213,3 +213,64 @@ class randomize_wrist_camera_mount(ManagerTermBase):
         camera.set_world_poses(position, orientation, env_ids=ids, convention="ros")
         # Reading camera.data above may have rendered the old pose; invalidate it for the new episode.
         camera.reset(env_ids=ids)
+
+
+# --- STEP 1: ボール把持＆持ち上げ用のリセットイベント ---
+class reset_ball_step1(ManagerTermBase):
+    """ロボットを初期姿勢にリセットし、机の上のランダムな位置にボールを配置する。"""
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        from isaaclab_tutorial.tasks.place_vial.config.so101.env_cfg import WORKSHOP_INITIAL_JOINT_POSITION
+        self.default_joint_pos = torch.tensor(WORKSHOP_INITIAL_JOINT_POSITION, device=env.device)
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids: torch.Tensor | None,
+        ball_pos_center: tuple[float, float] = (0.23, 0.0),
+        ball_pos_noise: tuple[float, float] = (0.03, 0.04),
+    ) -> None:
+        from .task import VIAL_REST_HEIGHT
+
+        ids = _ids(env, env_ids)
+        n = len(ids)
+
+        # 1. ロボット関節を初期ポーズ（ホーム位置）へリセット
+        robot = env.scene["robot"]
+        joint_pos = self.default_joint_pos.unsqueeze(0).expand(n, -1)
+        zeros = torch.zeros_like(joint_pos)
+        robot.write_joint_position_to_sim_index(position=joint_pos, env_ids=ids)
+        robot.write_joint_velocity_to_sim_index(velocity=zeros, env_ids=ids)
+        robot.set_joint_position_target_index(target=joint_pos, env_ids=ids)
+        robot.set_joint_velocity_target_index(target=zeros, env_ids=ids)
+
+        # 2. 机の上の基準位置（±ランダムノイズ）にボールを配置
+        ball_pos = torch.zeros((n, 7), device=env.device)
+        u_x = torch.empty(n, device=env.device).uniform_(-ball_pos_noise[0], ball_pos_noise[0])
+        u_y = torch.empty(n, device=env.device).uniform_(-ball_pos_noise[1], ball_pos_noise[1])
+        support_h = getattr(env, "_so101_support_height", 0.0)
+        h = support_h[ids] if isinstance(support_h, torch.Tensor) else support_h
+
+        ball_pos[:, 0] = ball_pos_center[0] + u_x
+        ball_pos[:, 1] = ball_pos_center[1] + u_y
+        ball_pos[:, 2] = VIAL_REST_HEIGHT + h
+        ball_pos[:, 6] = 1.0  # 単位クォータニオン (XYZW: 0, 0, 0, 1)
+
+        # 環境原点のオフセットを適用
+        ball_world_pos = ball_pos.clone()
+        ball_world_pos[:, :3] += env.scene.env_origins[ids]
+
+        ball = env.scene["vial"]
+        ball.write_root_pose_to_sim_index(root_pose=ball_world_pos, env_ids=ids)
+        ball.write_root_velocity_to_sim_index(root_velocity=torch.zeros((n, 6), device=env.device), env_ids=ids)
+
+        # 3. 把持・リフト等の追跡フラグを初期化
+        for attr, shape in (
+            ("_so101_reset_grasped", (env.num_envs,)),
+            ("_so101_reset_lifted", (env.num_envs,)),
+            ("_so101_reset_vial_pose", (env.num_envs, 7)),
+        ):
+            if not hasattr(env, attr):
+                setattr(env, attr, torch.zeros(shape, device=env.device, dtype=torch.bool if "grasp" in attr or "lift" in attr else torch.float32))
+            getattr(env, attr)[ids] = False if "grasp" in attr or "lift" in attr else ball_pos

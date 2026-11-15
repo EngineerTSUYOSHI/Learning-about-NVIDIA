@@ -13,13 +13,28 @@ from .geometry import cylinder_lowest_offset, hole_relative_positions, rack_loca
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-# Task geometry [m]. Rack quantities use the rack frame, whose origin is the first opening.
-VIAL_REST_HEIGHT = 0.052
-"""Root height of a vial lying on the desk."""
-VIAL_AXIS_MIN, VIAL_AXIS_MAX, VIAL_RADIUS = -0.017, 0.100, 0.0177
-"""Vial extent along its axis relative to the root, and its collision radius."""
-VIAL_GRASP_OFFSET = (0.0, 0.0, 0.093145)
-"""Cap/shoulder point the jaws close on, in the vial frame."""
+# タスクの幾何学定数 [m]
+# --- 元の定義（小瓶: Vial） ---
+# VIAL_REST_HEIGHT = 0.052
+# """机の上に横たわる小瓶のルート高さ"""
+# VIAL_AXIS_MIN, VIAL_AXIS_MAX, VIAL_RADIUS = -0.017, 0.100, 0.0177
+# """小瓶の軸方向の長さ範囲と衝突判定の半径"""
+# VIAL_GRASP_OFFSET = (0.0, 0.0, 0.093145)
+# """グリッパーの爪が閉じる小瓶キャップ部のオフセット"""
+
+# --- STEP 1: ボールの把持＆持ち上げタスク用の定義 ---
+BALL_RADIUS = 0.020
+"""ボールの半径 [m]（直径40mm。現場に合わせて0.015〜0.025に変更可能）"""
+VIAL_REST_HEIGHT = 0.035 + BALL_RADIUS
+"""35mmの机の上に静止しているボールの中心の高さ [m]"""
+VIAL_AXIS_MIN, VIAL_AXIS_MAX, VIAL_RADIUS = -BALL_RADIUS, BALL_RADIUS, BALL_RADIUS
+"""球体のサイズ範囲と衝突判定の半径"""
+VIAL_GRASP_OFFSET = (0.0, 0.0, 0.0)
+"""ボールの掴み目標位置（球体の中心原点）"""
+BALL_LIFT_TARGET_HEIGHT = 0.120
+"""STEP 1の成功判定となる目標持ち上げ高さ [m]（机から約6.5cm上空）"""
+BALL_LIFT_MIN_HEIGHT = VIAL_REST_HEIGHT + 0.010
+"""机から確実に浮いていると判定する最小クリアランス高さ [m]（机+1cm）"""
 FIXED_FINGERTIP_OFFSET = (-0.01289, -0.00022, -0.0986)
 MOVING_FINGERTIP_OFFSET = (-0.0068, -0.0766, 0.0189)
 RACK_RIM_HEIGHT = 0.073
@@ -78,13 +93,31 @@ def vial_height(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 def vial_in_rack(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Rack-local vial root position, rack-local vial axis, and the vial's lowest rack-local height."""
-    vial, rack = env.scene["vial"], env.scene["rack"]
+    # --- 元の処理（シーン内にラックが存在することを前提） ---
+    # vial, rack = env.scene["vial"], env.scene["rack"]
+    # vial_pos, vial_quat = vial.data.root_pos_w.torch, vial.data.root_quat_w.torch
+    # rack_pos, rack_quat = rack.data.root_pos_w.torch, rack.data.root_quat_w.torch
+    # position = rack_local_position(vial_pos, rack_pos, rack_quat)
+    # axis = quat_apply_inverse(
+    #     rack_quat, quat_apply(vial_quat, vial_pos.new_tensor((0.0, 0.0, 1.0)).expand_as(vial_pos))
+    # )
+    # lowest = position[:, 2] + cylinder_lowest_offset(axis[:, 2], VIAL_AXIS_MIN, VIAL_AXIS_MAX, VIAL_RADIUS)
+    # return position, axis, lowest
+
+    # --- STEP 1: ラックをシーンから削除した場合の安全なフォールバック ---
+    vial = env.scene["vial"]
     vial_pos, vial_quat = vial.data.root_pos_w.torch, vial.data.root_quat_w.torch
-    rack_pos, rack_quat = rack.data.root_pos_w.torch, rack.data.root_quat_w.torch
-    position = rack_local_position(vial_pos, rack_pos, rack_quat)
-    axis = quat_apply_inverse(
-        rack_quat, quat_apply(vial_quat, vial_pos.new_tensor((0.0, 0.0, 1.0)).expand_as(vial_pos))
-    )
+    if "rack" in env.scene.keys():  # noqa: SIM118
+        rack = env.scene["rack"]
+        rack_pos, rack_quat = rack.data.root_pos_w.torch, rack.data.root_quat_w.torch
+        position = rack_local_position(vial_pos, rack_pos, rack_quat)
+        axis = quat_apply_inverse(
+            rack_quat, quat_apply(vial_quat, vial_pos.new_tensor((0.0, 0.0, 1.0)).expand_as(vial_pos))
+        )
+    else:
+        # ラックがない場合はボール自身の座標系をそのまま使用
+        position = vial_pos
+        axis = quat_apply(vial_quat, vial_pos.new_tensor((0.0, 0.0, 1.0)).expand_as(vial_pos))
     lowest = position[:, 2] + cylinder_lowest_offset(axis[:, 2], VIAL_AXIS_MIN, VIAL_AXIS_MAX, VIAL_RADIUS)
     return position, axis, lowest
 
@@ -106,3 +139,20 @@ def gripper_openness(env: ManagerBasedRLEnv) -> torch.Tensor:
 def vial_upright(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Cosine of the vial axis with world vertical, clamped to [0, 1]."""
     return vertical_alignment(env.scene["vial"].data.root_quat_w.torch)
+
+
+# --- STEP 1: ボールの把持＆持ち上げ判定用ヘルパー関数 ---
+def ball_is_holding(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """両爪がボールに接触し、かつボールが机のクリアランスを超えて浮いている場合に True を返す。"""
+    fixed, moving = jaw_contacts(env)
+    support_height = getattr(env, "_so101_support_height", 0.0)
+    lifted_off_desk = vial_height(env) > (BALL_LIFT_MIN_HEIGHT + support_height)
+    return fixed & moving & lifted_off_desk
+
+
+def ball_lift_height_progress(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """机の上に静止している基準高さから、どれだけ上に持ち上がったか [m]（0以上）。"""
+    support_height = getattr(env, "_so101_support_height", 0.0)
+    current_h = vial_height(env)
+    rest_h = VIAL_REST_HEIGHT + support_height
+    return (current_h - rest_h).clamp_min(0.0)

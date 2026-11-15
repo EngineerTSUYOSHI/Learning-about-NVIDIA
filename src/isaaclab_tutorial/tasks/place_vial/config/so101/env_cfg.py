@@ -128,6 +128,27 @@ class VialSpawnCfg(sim_utils.UsdFileCfg):
     randomize_diameters: bool = False
 
 
+# --- STEP 1: ボール（球体プリミティブ）のスポーン設定 ---
+@clone
+def _spawn_ball(prim_path: str, cfg: Any, translation=None, orientation=None, **kwargs):
+    prim = sim_utils.spawn_sphere(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
+    _bind_workshop_contact_material(prim, prim_path)
+    return prim
+
+
+@configclass
+class BallSpawnCfg(sim_utils.SphereCfg):
+    """STEP 1 ボール把持用の剛体球体設定（接触マテリアル・青色プレビュー付き）"""
+
+    func = _spawn_ball
+    radius: float = mdp.task.BALL_RADIUS
+    rigid_props: sim_utils.UsdPhysicsRigidBodyCfg = sim_utils.UsdPhysicsRigidBodyCfg()
+    collision_props: sim_utils.UsdPhysicsCollisionCfg = sim_utils.UsdPhysicsCollisionCfg()
+    mass_props: sim_utils.MassCfg = sim_utils.MassCfg(mass=0.02)
+    physics_material: sim_utils.RigidBodyMaterialCfg = WORKSHOP_CONTACT_MATERIAL
+    visual_material: sim_utils.PreviewSurfaceCfg = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.45, 0.95))
+
+
 @clone
 def _spawn_support(prim_path, cfg, translation=None, orientation=None, **kwargs):
     from pxr import Sdf
@@ -460,28 +481,21 @@ class SO101SceneCfg(InteractiveSceneCfg):
         soft_joint_pos_limit_factor=0.98,
     )
 
+    # --- 元の定義（小瓶: Vial と ラック: Rack） ---
+    # vial = RigidObjectCfg(...)
+    # rack = RigidObjectCfg(...)
+
+    # --- STEP 1: ボールオブジェクト（小瓶の代替）とラックの除外 ---
     vial = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Vial",
-        spawn=VialSpawnCfg(
-            usd_path=str(VIAL_USD),
-            rigid_props=preset(
-                default=None,
-                physx=PhysxRigidBodyCfg(solver_position_iteration_count=PHYSX_SOLVER_POSITION_ITERATIONS),
-            ),
+        spawn=BallSpawnCfg(
+            radius=mdp.task.BALL_RADIUS,
             activate_contact_sensors=True,
-            randomize_diameters=preset(default=False, sim2real=True),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=TABLETOP_VIAL_POSITION,
-            # Horizontal vial: +90 degrees about world Y (XYZW).
-            rot=(0.0, 0.7071068, 0.0, 0.7071068),
+            pos=(0.23, 0.0, mdp.task.VIAL_REST_HEIGHT),
+            rot=(0.0, 0.0, 0.0, 1.0),
         ),
-    )
-
-    rack = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Rack",
-        spawn=sim_utils.UsdFileCfg(usd_path=str(RACK_USD), func=_spawn_usd_with_contact_material),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(0.18, 0.08, 0.04)),
     )
 
     desk = AssetBaseCfg(
@@ -513,11 +527,12 @@ class SO101SceneCfg(InteractiveSceneCfg):
         filter_prim_paths_expr=["{ENV_REGEX_NS}/Vial"],
         history_length=4,
     )
-    vial_rack_contact = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Vial",
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Rack"],
-        history_length=4,
-    )
+    # --- Original vial_rack_contact commented out (Rack removed for Step 1) ---
+    # vial_rack_contact = ContactSensorCfg(
+    #     prim_path="{ENV_REGEX_NS}/Vial",
+    #     filter_prim_paths_expr=["{ENV_REGEX_NS}/Rack"],
+    #     history_length=4,
+    # )
     fixed_jaw_support = preset(default=None, sim2real=_jaw_support_sensor("gripper"))
     moving_jaw_support = preset(default=None, sim2real=_jaw_support_sensor("moving_jaw_so101_v1"))
 
@@ -629,10 +644,14 @@ class EventsCfg:
             "operation": "abs",
         },
     )
-    reset_from_dataset = EventTerm(
-        func=mdp.ResetFromDataset,
+    # --- 元の処理（事前に作成された小瓶タスク用データセットからのリセット） ---
+    # reset_from_dataset = EventTerm(...)
+
+    # --- STEP 1: 机の上にボールをランダム配置してロボットを初期姿勢にするリセット ---
+    reset_ball = EventTerm(
+        func=mdp.reset_ball_step1,
         mode="reset",
-        params={"dataset_path": str(RESET_DATASET), "sequential": False, "phase_weights": ALL_PHASES},
+        params={"ball_pos_center": (0.23, 0.0), "ball_pos_noise": (0.03, 0.04)},
     )
 
 
@@ -702,27 +721,32 @@ class Sim2RealEventsCfg(EventsCfg):
     def __post_init__(self):
         self.vial_mass.mode = "reset"
         self.vial_mass.params["mass_distribution_params"] = (0.012, 0.030)
-        self.reset_from_dataset.params.update(
-            phase_weights=CANONICAL_START,
-            home_position_noise=0.02,
-            home_rack_clearance=0.001,
-            home_rack_position_noise=0.005,
-            home_rack_yaw_noise=math.radians(5),
-            home_heading_noise=math.radians(15),
-            support_height_range=(0.0, 0.004),
-        )
+        # --- Original (Dataset resets) ---
+        if hasattr(self, "reset_from_dataset"):
+            self.reset_from_dataset.params.update(
+                phase_weights=CANONICAL_START,
+                home_position_noise=0.02,
+                home_rack_clearance=0.001,
+                home_rack_position_noise=0.005,
+                home_rack_yaw_noise=math.radians(5),
+                home_heading_noise=math.radians(15),
+                support_height_range=(0.0, 0.004),
+            )
 
 
 @configclass
 class RewardsCfg:
-    """Sparse physical milestones, a success bonus, two dense shaping terms, and light regularization."""
+    """STEP 1 報酬設計: アプローチ＆持ち上げシェーピング報酬、マイルストーン、押し付けペナルティ"""
 
-    # Sim2real aims the pad centre slightly above the cap, favouring a shallower pinch clear of the mat.
+    # ボール中心への接近報酬（球体中心を狙うためオフセットは0）
     approach_progress = RewTerm(
-        func=mdp.approach_progress, weight=1.0, params={"height_offset": preset(default=0.0, sim2real=0.008)}
+        func=mdp.approach_progress, weight=1.0, params={"height_offset": 0.0}
     )
-    held_goal = RewTerm(func=mdp.held_goal, weight=0.1)
-    milestones = RewTerm(func=mdp.milestones, weight=10.0)
+    # 持ち上げシェーピング報酬: ボールを浮かせている間、目標高さに近づくほど連続的に加点
+    held_goal = RewTerm(func=mdp.lift_progress, weight=1.0)
+    # マイルストーン報酬: 把持達成(+5.0) および 目標高さ到達(+10.0) の1回限りボーナス
+    milestones = RewTerm(func=mdp.milestones, weight=1.0)
+    # 完了ボーナス: 目標高さ以上で安定キープできた時の成功報酬
     success = RewTerm(func=mdp.success, weight=200.0)
     vial_lost = RewTerm(
         func=mdp.is_terminated_term, weight=-50.0, params={"term_keys": ["vial_out_of_bounds", "vial_dropped"]}
@@ -730,10 +754,8 @@ class RewardsCfg:
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.002)
     joint_velocity = RewTerm(func=mdp.joint_vel_l2, weight=-0.0002)
     joint_limits = RewTerm(func=mdp.joint_pos_limits, weight=-1.0)
-    jaw_support_force = preset(
-        default=None,
-        sim2real=RewTerm(func=mdp.jaw_support_force, weight=-8.0, params={"free_force": 0.25, "force_span": 2.0}),
-    )
+    # 机押し付けペナルティ: 爪が机を強く押すと減点（上から押し付けて両爪接触をごまかすのを防止）
+    jaw_support_force = RewTerm(func=mdp.jaw_support_force, weight=-8.0, params={"free_force": 0.25, "force_span": 2.0})
 
 
 @configclass
@@ -813,8 +835,10 @@ class SO101VialEnvCfg(ManagerBasedRLEnvCfg):
             self.scene.num_envs = min(requested_num_envs, evaluation.EVALUATION_EPISODES)
         else:
             self.scene.num_envs = min(self.scene.num_envs, 16)
-        self.events.reset_from_dataset.params["sequential"] = True
-        self.events.reset_from_dataset.params["phase_weights"] = CANONICAL_START
+        # --- Original (Reset from dataset in play mode) ---
+        if hasattr(self.events, "reset_from_dataset"):
+            self.events.reset_from_dataset.params["sequential"] = True
+            self.events.reset_from_dataset.params["phase_weights"] = CANONICAL_START
         if not isinstance(self.events, Sim2RealEventsCfg):
             self.events.vial_material.params.update(
                 static_friction_range=(0.7, 0.7), dynamic_friction_range=(0.7, 0.7), restitution_range=(0.0, 0.0)

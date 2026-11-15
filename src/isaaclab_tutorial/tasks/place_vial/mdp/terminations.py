@@ -63,24 +63,36 @@ class placement_success(ManagerTermBase):
             self.progress.lifted[ids] = self._env._so101_reset_lifted[ids]
 
     def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
-        position, _, lowest = vial_in_rack(env)
-        upright = vial_upright(env) > UPRIGHT_ALIGNMENT
-        fixed, moving = jaw_contacts(env)
-        support_height = getattr(env, "_so101_support_height", 0.0)
-        holding = fixed & moving & (vial_height(env) > VIAL_REST_HEIGHT + 0.006 + support_height)
-        cleared = lowest >= RACK_CLEARANCE_HEIGHT
-        inserted = (nearest_hole_distance(position) < INSERTION_RADIUS) & (lowest < RACK_RIM_HEIGHT) & upright
-        vial = env.scene["vial"]
-        still = (torch.linalg.vector_norm(vial.data.root_lin_vel_w.torch, dim=-1) < 0.06) & (
-            torch.linalg.vector_norm(vial.data.root_ang_vel_w.torch, dim=-1) < 0.8
-        )
-        released = ~(fixed | moving) & (gripper_openness(env) > 0.2)
-        placed = inside_bounds(hole_relative_positions(position), SEATED_LOWER, SEATED_UPPER).any(dim=-1)
-        rack_force = contact_force(env, "vial_rack_contact")
-        self.max_rack_force = torch.maximum(self.max_rack_force, rack_force)
-        self.progress.unsafe_rack_contact |= rack_force > HARD_RACK_IMPACT_FORCE
+        # --- 元の処理（小瓶をラック穴に挿入して手放す判定） ---
+        # position, _, lowest = vial_in_rack(env)
+        # upright = vial_upright(env) > UPRIGHT_ALIGNMENT
+        # fixed, moving = jaw_contacts(env)
+        # support_height = getattr(env, "_so101_support_height", 0.0)
+        # holding = fixed & moving & (vial_height(env) > VIAL_REST_HEIGHT + 0.006 + support_height)
+        # cleared = lowest >= RACK_CLEARANCE_HEIGHT
+        # inserted = (nearest_hole_distance(position) < INSERTION_RADIUS) & (lowest < RACK_RIM_HEIGHT) & upright
+        # vial = env.scene["vial"]
+        # still = ...
+        # released = ~(fixed | moving) & (gripper_openness(env) > 0.2)
+        # placed = inside_bounds(...)
+
+        # --- STEP 1: ボール把持＆持ち上げ完了の成功判定 ---
+        from .task import BALL_LIFT_TARGET_HEIGHT, ball_is_holding, vial_height
+
+        holding = ball_is_holding(env)  # 両爪でボールを挟み、机から浮かせているか
+        lifted_to_target = holding & (vial_height(env) >= BALL_LIFT_TARGET_HEIGHT)  # 把持したまま目標高さに到達したか
+        cleared = lifted_to_target
+        inserted = lifted_to_target
+        # ボールを把持したまま目標高さ以上で一定ステップ連続保持できたらエピソード成功
+        placed = lifted_to_target
+
+        if "vial_rack_contact" in env.scene.sensors:
+            rack_force = contact_force(env, "vial_rack_contact")
+            self.max_rack_force = torch.maximum(self.max_rack_force, rack_force)
+            self.progress.unsafe_rack_contact |= rack_force > HARD_RACK_IMPACT_FORCE
+
         success = self.progress.update(
-            holding, cleared, inserted, placed & upright & released & still, env.episode_length_buf
+            holding, cleared, inserted, placed, env.episode_length_buf
         )
 
         log = env.extras.setdefault("log", {})

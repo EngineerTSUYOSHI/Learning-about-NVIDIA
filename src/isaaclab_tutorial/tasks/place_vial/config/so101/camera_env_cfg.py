@@ -75,7 +75,11 @@ class SO101CameraSceneCfg(SO101SceneCfg):
 
     def __post_init__(self):
         self.robot.spawn.hide_camera_housing = False
-        self.vial.spawn.usd_path = str(VIAL_LABELED_USD)
+        # --- 元の処理: ラベル付き小瓶USDへの差し替え ---
+        # self.vial.spawn.usd_path = str(VIAL_LABELED_USD)
+        # STEP 1対応: ボール（球体プリミティブ）時は上書きせずそのままカメラに青いボールを描画させる
+        if hasattr(self.vial.spawn, "usd_path"):
+            self.vial.spawn.usd_path = str(VIAL_LABELED_USD)
 
 
 @configclass

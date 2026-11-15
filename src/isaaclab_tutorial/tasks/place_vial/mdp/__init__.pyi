@@ -1,6 +1,8 @@
 __all__ = [
     "ResetFromDataset",
+    "reset_ball_step1",
     "approach_progress",
+    "lift_progress",
     "encoder_joint_pos",
     "encoder_joint_target",
     "held_goal",
@@ -32,6 +34,7 @@ from .events import (
     randomize_encoder_bias,
     randomize_joint_viscous_friction,
     randomize_wrist_camera_mount,
+    reset_ball_step1,
 )
 from .observations import (
     encoder_joint_pos,
@@ -43,5 +46,5 @@ from .observations import (
     vial_in_rack_frame,
     wrist_rgb,
 )
-from .rewards import approach_progress, held_goal, jaw_support_force, milestones, success
+from .rewards import approach_progress, held_goal, jaw_support_force, lift_progress, milestones, success
 from .terminations import placement_success, vial_dropped
