@@ -14,6 +14,7 @@ from .task import (
     BALL_LIFT_TARGET_HEIGHT,
     BALL_REST_HEIGHT,
     ball_grasp_point_w,
+    ball_in_jaws,
     ball_is_holding,
     ball_lift_height_progress,
     contact_force,
@@ -45,14 +46,21 @@ class approach_progress(ManagerTermBase):
         return torch.where(ball_lift_progress(env).grasped, 0.0, progress.nan_to_num(0.0))
 
 
-def lift_progress(env: ManagerBasedRLEnv, target_height: float = BALL_LIFT_TARGET_HEIGHT) -> torch.Tensor:
-    """ボールを両爪で把持して机から浮かせている間、目標高さに近づくほど連続的に加点される密な報酬。"""
+def lift_progress(
+    env: ManagerBasedRLEnv,
+    target_height: float = BALL_LIFT_TARGET_HEIGHT,
+    pinch_bonus: float = 0.15,
+) -> torch.Tensor:
+    """爪の間でボールを挟んだ状態（+0.15）から、目標高さへ持ち上げるにつれて最大 1.0 まで連続的に加点される密な報酬。"""
+    in_jaws = ball_in_jaws(env)
     holding = ball_is_holding(env)
     target = target_height if target_height > 0.0 else BALL_LIFT_TARGET_HEIGHT
     max_travel = max(target - BALL_REST_HEIGHT, 0.01)
     height_ratio = (ball_lift_height_progress(env) / max_travel).clamp(0.0, 1.0)
-    # 単に机を押しているだけでは報酬を与えず、実際に把持して浮かせている時のみ高さに比例して報酬を与える
-    return torch.where(holding, height_ratio, 0.0)
+    # 工程②: 机の上でも爪の間にボールを入れて両爪で挟めばベース報酬（pinch_bonus）を付与
+    # 工程③: 机から浮かせている間（holding）は高さに応じて pinch_bonus 〜 1.0 まで連続加点
+    lift_score = pinch_bonus + (1.0 - pinch_bonus) * height_ratio
+    return torch.where(holding, lift_score, torch.where(in_jaws, pinch_bonus, 0.0))
 
 
 class milestones(ManagerTermBase):
