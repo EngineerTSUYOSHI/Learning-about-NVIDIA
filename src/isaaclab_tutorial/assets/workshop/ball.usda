@@ -1,0 +1,53 @@
+#usda 1.0
+(
+    defaultPrim = "Ball"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "Ball" (
+    prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+)
+{
+    float physics:mass = 0.02
+
+    # --- パターンA: ボール（球体・半径2cm = 直径4cm） ---
+    def Sphere "Geometry" (
+        prepend apiSchemas = ["PhysicsCollisionAPI", "MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </Ball/Looks/BallMaterial>
+        double radius = 0.02
+        double3 xformOp:translate = (0, 0, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    # --- パターンB: 試験用の立方体（1辺4cm・机の上で転がらない） ---
+    # ボールが転がりすぎて学習が難しい場合は、上のパターンAを # でコメントアウトし、
+    # 下のパターンBのコメントを外すだけで、Pythonコード無修正のまま立方体に切り替えられます。
+    # def Cube "Geometry" (
+    #     prepend apiSchemas = ["PhysicsCollisionAPI", "MaterialBindingAPI"]
+    # )
+    # {
+    #     rel material:binding = </Ball/Looks/BallMaterial>
+    #     double size = 0.04
+    #     double3 xformOp:translate = (0, 0, 0)
+    #     uniform token[] xformOpOrder = ["xformOp:translate"]
+    # }
+
+    def Scope "Looks"
+    {
+        def Material "BallMaterial"
+        {
+            token outputs:surface.connect = </Ball/Looks/BallMaterial/Shader.outputs:surface>
+
+            def Shader "Shader"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.1, 0.45, 0.95)
+                float inputs:metallic = 0
+                float inputs:roughness = 0.4
+            }
+        }
+    }
+}

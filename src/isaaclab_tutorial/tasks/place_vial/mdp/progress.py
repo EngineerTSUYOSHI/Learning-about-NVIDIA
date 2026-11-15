@@ -1,17 +1,16 @@
-"""Episode-local task milestones with safe partial-reset semantics."""
+"""エピソードごとのタスク進捗（把持・リフト・成功）を管理するモジュール。"""
 
 from collections.abc import Sequence
 
 import torch
 
 
-class PlacementProgress:
-    """Per-episode milestones, each latched the first time it is observed.
+class BallLiftProgress:
+    """エピソード単位のマイルストーンを保持するクラス。
 
-    * ``grasped``: both jaws hold the vial off the desk for ``grasp_steps`` consecutive steps,
-    * ``lifted``: the vial's lowest point has cleared the rack rim,
-    * ``inserted``: the upright vial's tip is inside a hole,
-    * ``success``: the released vial has rested upright in a hole for ``stable_steps`` consecutive steps.
+    * ``grasped``: 両爪でボールを机から浮かせて ``grasp_steps`` 連続保持した状態
+    * ``lifted``: ボールが目標持ち上げ高さに到達した状態
+    * ``success``: 目標高さ以上で ``stable_steps`` 連続保持してタスク成功となった状態
     """
 
     def __init__(self, num_envs: int, device: str | torch.device, stable_steps: int = 10, grasp_steps: int = 2):
@@ -19,21 +18,17 @@ class PlacementProgress:
         self.grasp_steps = grasp_steps
         self.grasped = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self.lifted = torch.zeros_like(self.grasped)
-        self.inserted = torch.zeros_like(self.grasped)
         self.success = torch.zeros_like(self.grasped)
-        self.unsafe_rack_contact = torch.zeros_like(self.grasped)
         self.grasp_count = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.stable_count = torch.zeros(num_envs, dtype=torch.long, device=device)
         self.time_to_success = torch.full((num_envs,), -1, dtype=torch.long, device=device)
 
     def reset(self, env_ids: Sequence[int] | slice | torch.Tensor | None = None) -> None:
-        """Reset only the requested environments."""
+        """指定された環境IDの進捗のみリセットする。"""
         ids = slice(None) if env_ids is None else env_ids
         self.grasped[ids] = False
         self.lifted[ids] = False
-        self.inserted[ids] = False
         self.success[ids] = False
-        self.unsafe_rack_contact[ids] = False
         self.grasp_count[ids] = 0
         self.stable_count[ids] = 0
         self.time_to_success[ids] = -1
@@ -41,25 +36,22 @@ class PlacementProgress:
     def update(
         self,
         holding: torch.Tensor,
-        cleared: torch.Tensor,
-        inserted: torch.Tensor,
-        seated: torch.Tensor,
+        lifted: torch.Tensor,
         step: torch.Tensor,
     ) -> torch.Tensor:
-        """Latch milestones from the current physical state and return confirmed success."""
+        """現在の物理状態からマイルストーンを更新し、成功確定フラグを返す。"""
         self.grasp_count.copy_(torch.where(holding, self.grasp_count + 1, torch.zeros_like(self.grasp_count)))
         self.grasped |= self.grasp_count >= self.grasp_steps
-        self.lifted |= cleared
-        self.inserted |= inserted
-        self.stable_count.copy_(torch.where(seated, self.stable_count + 1, torch.zeros_like(self.stable_count)))
+        self.lifted |= lifted
+        self.stable_count.copy_(torch.where(lifted, self.stable_count + 1, torch.zeros_like(self.stable_count)))
         newly_successful = ~self.success & (self.stable_count >= self.stable_steps)
         self.time_to_success.copy_(torch.where(newly_successful, step, self.time_to_success))
         self.success |= newly_successful
         return self.success.clone()
 
 
-def placement_progress(env) -> PlacementProgress:
-    """Return the episode progress shared by the success termination, rewards and observations."""
-    if not hasattr(env, "_so101_placement_progress"):
-        env._so101_placement_progress = PlacementProgress(env.num_envs, env.device)
-    return env._so101_placement_progress
+def ball_lift_progress(env) -> BallLiftProgress:
+    """終了判定・報酬・観測で共有する進捗インスタンスを返す。"""
+    if not hasattr(env, "_so101_ball_lift_progress"):
+        env._so101_ball_lift_progress = BallLiftProgress(env.num_envs, env.device)
+    return env._so101_ball_lift_progress

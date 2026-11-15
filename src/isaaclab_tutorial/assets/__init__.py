@@ -3,6 +3,7 @@
 from pathlib import Path
 
 ASSET_ROOT = Path(__file__).parent
+BALL_USD = ASSET_ROOT / "workshop" / "ball.usda"
 VIAL_USD = ASSET_ROOT / "workshop" / "vial.usda"
 VIAL_LABELED_USD = ASSET_ROOT / "workshop" / "vial_labeled.usda"
 RACK_USD = ASSET_ROOT / "workshop" / "rack.usda"
