@@ -699,10 +699,11 @@ class RewardsCfg:
     approach_progress = RewTerm(
         func=mdp.approach_progress, weight=1.0, params={"height_offset": 0.0}
     )
-    # 持ち上げシェーピング報酬: ボールを浮かせている間、目標高さに近づくほど連続的に加点
-    lift_progress = RewTerm(func=mdp.lift_progress, weight=1.0)
-    # マイルストーン報酬: 把持達成(+5.0) および 目標高さ到達(+10.0) の1回限りボーナス
-    milestones = RewTerm(func=mdp.milestones, weight=1.0)
+    # 持ち上げシェーピング報酬: ボールを浮かせている間、目標高さに近づくほど連続的に加点（1ステップ最大 0.3）
+    # gamma=0.995 では「目標直前で保持し続ける」価値は最大でも約60程度となり、成功(200+20)を明確に下回る。
+    lift_progress = RewTerm(func=mdp.lift_progress, weight=0.3, params={"pinch_bonus": 0.1})
+    # マイルストーン報酬: 把持達成(+10.0) および 目標高さ到達(+20.0) の1回限りボーナス
+    milestones = RewTerm(func=mdp.milestones, weight=1.0, params={"grasp_bonus": 10.0, "lift_bonus": 20.0})
     # 完了ボーナス: 目標高さ以上で安定キープできた時の成功報酬
     success = RewTerm(func=mdp.success, weight=200.0)
     ball_lost = RewTerm(

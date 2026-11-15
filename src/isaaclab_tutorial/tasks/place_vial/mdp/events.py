@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -102,12 +103,20 @@ class reset_ball_step1(ManagerTermBase):
 
     * 通常スタート（確率 ``1 - grasp_prob``）: ロボットをホーム姿勢にリセットし、机の上のランダム位置にボールを配置する。
     * 把持スタート（確率 ``grasp_prob``）: 机のすぐ上で爪がボールを挟んだ状態から開始し、持ち上げ動作（リフト）の学習を促進する。
+
+    把持スタートのグリッパー角度は、両爪先端の間隔がボール直径 + ``grip_clearance`` になる角度を
+    初回リセット時にFKで求めて使う（固定値だとボールと爪がめり込んで弾き飛ばされるか、隙間が空いて落下するため）。
+    行動は「現在角度からの相対目標」なので、リセット時に与えた閉じ方向の目標は最初の1ステップしか効かない。
+    以降の保持はポリシー自身がグリッパーを閉じ続けることで行う。
     """
+
+    # キャリブレーションで掃引するグリッパー角度範囲 [rad]（ボール直径40mm前後を十分含む範囲）
+    _CALIBRATION_RANGE = (math.radians(-12.0), math.radians(60.0))
+    _CALIBRATION_SAMPLES = 64
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         from isaaclab_tutorial.tasks.place_vial.config.so101.env_cfg import (
-            GRASP_GRIPPER_POSITION,
             WORKSHOP_GRASP_JOINT_POSITION,
             WORKSHOP_INITIAL_JOINT_POSITION,
             WORKSHOP_LIFT_MID_JOINT_POSITION,
@@ -116,7 +125,44 @@ class reset_ball_step1(ManagerTermBase):
         self.default_joint_pos = torch.tensor(WORKSHOP_INITIAL_JOINT_POSITION, device=env.device)
         self.grasp_joint_pos = torch.tensor(WORKSHOP_GRASP_JOINT_POSITION, device=env.device)
         self.lift_mid_joint_pos = torch.tensor(WORKSHOP_LIFT_MID_JOINT_POSITION, device=env.device)
-        self.grasp_gripper_target = float(GRASP_GRIPPER_POSITION)
+        self.grip_angle: float | None = None
+
+    def _calibrate_grip_angle(self, env: ManagerBasedRLEnv, ids: torch.Tensor, clearance: float) -> float:
+        """両爪先端の間隔が ``2 * BALL_RADIUS + clearance`` になるグリッパー角度 [rad] をFKで求める。
+
+        爪先端の間隔はグリッパー関節角だけで決まる（腕の姿勢に依存しない）ので、一度求めれば使い回せる。
+        """
+        from .task import BALL_RADIUS, fingertip_positions_w
+
+        robot = env.scene["robot"]
+        angles = torch.linspace(*self._CALIBRATION_RANGE, self._CALIBRATION_SAMPLES, device=env.device)
+        gaps = torch.empty_like(angles)
+        n = len(ids)
+        for start in range(0, len(angles), n):
+            chunk = angles[start : start + n]
+            k = len(chunk)
+            pose = self.grasp_joint_pos.unsqueeze(0).expand(k, -1).clone()
+            pose[:, 5] = chunk
+            robot.write_joint_position_to_sim_index(position=pose, env_ids=ids[:k])
+            env.sim.forward()
+            fixed, moving = fingertip_positions_w(env)
+            gaps[start : start + k] = torch.linalg.vector_norm(fixed[ids[:k]] - moving[ids[:k]], dim=-1)
+
+        target_gap = 2.0 * BALL_RADIUS + clearance
+        order = torch.argsort(gaps)
+        sorted_gaps, sorted_angles = gaps[order].cpu(), angles[order].cpu()
+        if not (sorted_gaps[0] <= target_gap <= sorted_gaps[-1]):
+            raise RuntimeError(
+                f"グリッパー角度 {self._CALIBRATION_RANGE} の範囲で爪先端間隔 {target_gap:.4f} m を実現できません"
+                f"（測定範囲 {float(sorted_gaps[0]):.4f}〜{float(sorted_gaps[-1]):.4f} m）。"
+                "BALL_RADIUS または _CALIBRATION_RANGE を確認してください。"
+            )
+        index = int(torch.searchsorted(sorted_gaps, torch.tensor(target_gap)).clamp(1, len(sorted_gaps) - 1))
+        g0, g1 = float(sorted_gaps[index - 1]), float(sorted_gaps[index])
+        a0, a1 = float(sorted_angles[index - 1]), float(sorted_angles[index])
+        angle = a0 if g1 == g0 else a0 + (target_gap - g0) * (a1 - a0) / (g1 - g0)
+        print(f"[reset_ball_step1] 把持スタート用グリッパー角度: {math.degrees(angle):.2f} deg (爪先端間隔 {target_gap:.4f} m)")
+        return angle
 
     def __call__(
         self,
@@ -125,40 +171,70 @@ class reset_ball_step1(ManagerTermBase):
         ball_pos_center: tuple[float, float] = (0.23, 0.0),
         ball_pos_noise: tuple[float, float] = (0.03, 0.04),
         grasp_prob: float = 0.3,
+        grip_clearance: float = 0.001,
+        grip_squeeze: float = 0.15,
     ) -> None:
-        from .progress import ball_lift_progress
-        from .task import BALL_LIFT_MIN_HEIGHT, BALL_REST_HEIGHT, grasp_center_w
+        from .task import (
+            BALL_LIFT_MIN_HEIGHT,
+            BALL_LIFT_TARGET_HEIGHT,
+            BALL_RADIUS,
+            BALL_REST_HEIGHT,
+            fingertip_positions_w,
+            grasp_center_w,
+        )
 
         ids = _ids(env, env_ids)
         n = len(ids)
+        robot = env.scene["robot"]
+        origins = env.scene.env_origins[ids]
+        support_h = getattr(env, "_so101_support_height", 0.0)
+        h = support_h[ids] if isinstance(support_h, torch.Tensor) else support_h
 
         # 各環境を「把持スタート」にするか「通常ホームスタート」にするかを確率 grasp_prob で決定
-        is_grasped = torch.rand(n, device=env.device) < grasp_prob if grasp_prob > 0.0 else torch.zeros(
-            n, dtype=torch.bool, device=env.device
-        )
+        is_grasped = torch.rand(n, device=env.device) < grasp_prob
+        default_pose = self.default_joint_pos.unsqueeze(0).expand(n, -1)
 
-        # 1. ロボット関節角度・目標角度の設定
-        robot = env.scene["robot"]
-        joint_pos = self.default_joint_pos.unsqueeze(0).expand(n, -1).clone()
-        joint_target = joint_pos.clone()
-
+        # 1. 把持スタート姿勢の生成と妥当性チェック
+        grasp_pose = default_pose.clone()
+        jaw_center_w = None
         if is_grasped.any():
-            # 把持スタート環境: 机直上の把持ポーズ〜持ち上げ序盤ポーズの間をランダム補間し、少し関節ノイズを加える
+            if self.grip_angle is None:
+                self.grip_angle = self._calibrate_grip_angle(env, ids, grip_clearance)
+
+            # 机直上の把持ポーズ〜持ち上げ序盤ポーズの間をランダム補間し、少し関節ノイズを加える
             blend = torch.empty((n, 1), device=env.device).uniform_(0.0, 0.35)
             grasp_pose = torch.lerp(self.grasp_joint_pos.unsqueeze(0), self.lift_mid_joint_pos.unsqueeze(0), blend)
-            # XY方向の多様性を持たせるため shoulder_pan 等に微小なランダムノイズを付与
             noise = torch.zeros_like(grasp_pose)
             noise[:, 0].uniform_(-0.15, 0.15)  # shoulder_pan
             noise[:, 1].uniform_(-0.03, 0.03)  # shoulder_lift
             noise[:, 2].uniform_(-0.03, 0.03)  # elbow_flex
             grasp_pose = grasp_pose + noise
+            # 爪先端の間隔がボール直径＋クリアランスになる角度（めり込み・隙間なし）
+            grasp_pose[:, 5] = self.grip_angle
 
-            # グリッパーの目標角度は閉じ方向（GRASP_GRIPPER_POSITION）に設定してボールをしっかり保持させる
-            grasp_target = grasp_pose.clone()
-            grasp_target[:, 5] = self.grasp_gripper_target
+            # FKで爪の位置を確認し、机にめり込む姿勢・最初から目標高さ付近にある姿勢は通常スタートに切り替える
+            robot.write_joint_position_to_sim_index(
+                position=torch.where(is_grasped.unsqueeze(-1), grasp_pose, default_pose), env_ids=ids
+            )
+            env.sim.forward()
+            jaw_center_w = grasp_center_w(env)[ids]
+            fixed_w, moving_w = fingertip_positions_w(env)
+            lowest_tip = torch.minimum(fixed_w[ids, 2], moving_w[ids, 2]) - origins[:, 2]
+            center_z = jaw_center_w[:, 2] - origins[:, 2]
+            desk_top = BALL_REST_HEIGHT - BALL_RADIUS + h
+            valid = (
+                (center_z >= BALL_LIFT_MIN_HEIGHT + 0.002 + h)
+                & (center_z <= BALL_LIFT_TARGET_HEIGHT - 0.01)
+                & (lowest_tip >= desk_top + 0.002)
+            )
+            is_grasped &= valid
 
-            joint_pos = torch.where(is_grasped.unsqueeze(-1), grasp_pose, joint_pos)
-            joint_target = torch.where(is_grasped.unsqueeze(-1), grasp_target, joint_target)
+        # 2. ロボット関節角度・目標角度の確定
+        joint_pos = torch.where(is_grasped.unsqueeze(-1), grasp_pose, default_pose)
+        joint_target = joint_pos.clone()
+        # 把持スタートは最初の制御周期だけでも握り込むよう、閉じ方向の目標を与える
+        # （相対関節位置アクションのため、2ステップ目以降の握り込みはポリシーの出力で決まる）
+        joint_target[:, 5] = torch.where(is_grasped, joint_pos[:, 5] - grip_squeeze, joint_pos[:, 5])
 
         zeros = torch.zeros_like(joint_pos)
         robot.write_joint_position_to_sim_index(position=joint_pos, env_ids=ids)
@@ -166,50 +242,35 @@ class reset_ball_step1(ManagerTermBase):
         robot.set_joint_position_target_index(target=joint_target, env_ids=ids)
         robot.set_joint_velocity_target_index(target=zeros, env_ids=ids)
 
-        # 2. ボールの配置（通常スタートは机の上、把持スタートは両爪の中心座標へ配置）
+        # 3. ボールの配置（通常スタートは机の上、把持スタートは両爪先端の中点へ配置）
         ball_pos = torch.zeros((n, 7), device=env.device)
         u_x = torch.empty(n, device=env.device).uniform_(-ball_pos_noise[0], ball_pos_noise[0])
         u_y = torch.empty(n, device=env.device).uniform_(-ball_pos_noise[1], ball_pos_noise[1])
-        support_h = getattr(env, "_so101_support_height", 0.0)
-        h = support_h[ids] if isinstance(support_h, torch.Tensor) else support_h
-
         ball_pos[:, 0] = ball_pos_center[0] + u_x
         ball_pos[:, 1] = ball_pos_center[1] + u_y
         ball_pos[:, 2] = BALL_REST_HEIGHT + h
         ball_pos[:, 6] = 1.0  # 単位クォータニオン (XYZW: 0, 0, 0, 1)
+        if jaw_center_w is not None:
+            ball_pos[is_grasped, :3] = jaw_center_w[is_grasped] - origins[is_grasped]
 
         # 環境原点のオフセットを適用
         ball_world_pos = ball_pos.clone()
-        ball_world_pos[:, :3] += env.scene.env_origins[ids]
-
-        if is_grasped.any():
-            # 順運動学（FK）を更新して、現在の関節角度における両爪先端の中心座標（ワールド座標系）を取得
-            env.sim.forward()
-            jaw_center_w = grasp_center_w(env)[ids]
-            # 机とのめり込みを防ぎ、かつ浮いている判定（BALL_LIFT_MIN_HEIGHT）を満たす最低高さを保証
-            min_z_w = env.scene.env_origins[ids, 2] + BALL_LIFT_MIN_HEIGHT + 0.002 + h
-            jaw_center_w[:, 2] = torch.maximum(jaw_center_w[:, 2], min_z_w)
-
-            ball_world_pos[is_grasped, :3] = jaw_center_w[is_grasped]
-            ball_pos[is_grasped, :3] = ball_world_pos[is_grasped, :3] - env.scene.env_origins[ids[is_grasped]]
+        ball_world_pos[:, :3] += origins
 
         ball = env.scene["ball"]
         ball.write_root_pose_to_sim_index(root_pose=ball_world_pos, env_ids=ids)
         ball.write_root_velocity_to_sim_index(root_velocity=torch.zeros((n, 6), device=env.device), env_ids=ids)
 
-        # 3. 把持・リフト等の追跡フラグを初期化（把持スタート環境は最初から grasped=True に設定）
-        for attr, shape, val in (
-            ("_so101_reset_grasped", (env.num_envs,), is_grasped),
-            ("_so101_reset_lifted", (env.num_envs,), False),
-            ("_so101_reset_ball_pose", (env.num_envs, 7), ball_pos),
+        # 4. 追跡フラグの初期化
+        # 把持スタートでも grasped は最初から立てない。実際に保持できているかは進捗判定（両爪接触＋浮上が
+        # 連続 grasp_steps）に任せる。最初から立てると、取り落とした場合に観測フラグが実態と食い違い、
+        # 接近報酬や把持マイルストーンも得られなくなるため。
+        for attr, shape, dtype, val in (
+            ("_so101_reset_grasped", (env.num_envs,), torch.bool, False),
+            ("_so101_reset_lifted", (env.num_envs,), torch.bool, False),
+            ("_so101_reset_grasp_start", (env.num_envs,), torch.bool, is_grasped),
+            ("_so101_reset_ball_pose", (env.num_envs, 7), torch.float32, ball_pos),
         ):
             if not hasattr(env, attr):
-                dtype = torch.bool if "grasp" in attr or "lift" in attr else torch.float32
                 setattr(env, attr, torch.zeros(shape, device=env.device, dtype=dtype))
             getattr(env, attr)[ids] = val
-
-        # 進捗トラッカーにも把持スタート状態を同期
-        progress = ball_lift_progress(env)
-        progress.grasped[ids] = is_grasped
-        progress.grasp_count[ids] = torch.where(is_grasped, progress.grasp_steps, 0)
-        progress.lifted[ids] = False

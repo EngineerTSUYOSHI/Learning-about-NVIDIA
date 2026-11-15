@@ -42,16 +42,21 @@ class approach_progress(ManagerTermBase):
         distance = torch.linalg.vector_norm(grasp_center_w(env) - target, dim=-1)
         progress = ((self.previous_distance - distance) / scale).clamp(-1.0, 1.0)
         self.previous_distance = distance
-        # リセット直後の最初のステップは前回距離がNaNなので0を返す
-        return torch.where(ball_lift_progress(env).grasped, 0.0, progress.nan_to_num(0.0))
+        # リセット直後の最初のステップは前回距離がNaNなので0を返す。
+        # 「一度把持したら以降ずっと0」にすると、把持後に落とした場合に再接近の誘導が無くなるため、
+        # 現在ボールを保持している間だけ0にする（差分報酬なので離れる→近づくの往復で得はしない）。
+        return torch.where(ball_is_holding(env), 0.0, progress.nan_to_num(0.0))
 
 
 def lift_progress(
     env: ManagerBasedRLEnv,
     target_height: float = BALL_LIFT_TARGET_HEIGHT,
-    pinch_bonus: float = 0.15,
+    pinch_bonus: float = 0.1,
 ) -> torch.Tensor:
-    """爪の間でボールを挟んだ状態（+0.15）から、目標高さへ持ち上げるにつれて最大 1.0 まで連続的に加点される密な報酬。"""
+    """爪の間でボールを挟んだ状態（``pinch_bonus``）から、目標高さへ持ち上げるにつれて最大 1.0 まで連続的に加点される密な報酬。
+
+    目標直前で保持し続けるだけの報酬が成功ボーナスに匹敵しないよう、環境設定側の重みは小さめにしている。
+    """
     in_jaws = ball_in_jaws(env)
     holding = ball_is_holding(env)
     target = target_height if target_height > 0.0 else BALL_LIFT_TARGET_HEIGHT
@@ -64,7 +69,7 @@ def lift_progress(
 
 
 class milestones(ManagerTermBase):
-    """エピソード中に一度だけ支払われるマイルストーン報酬（把持: 5.0, 目標高さリフト: 10.0）。"""
+    """エピソード中に一度だけ支払われるマイルストーン報酬（既定値 把持: 10.0, 目標高さリフト: 20.0）。"""
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
@@ -77,11 +82,11 @@ class milestones(ManagerTermBase):
         self.paid[ids] = False
         self.started[ids] = False
 
-    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+    def __call__(self, env: ManagerBasedRLEnv, grasp_bonus: float = 10.0, lift_bonus: float = 20.0) -> torch.Tensor:
         progress = ball_lift_progress(env)
         reached = torch.stack((progress.grasped, progress.lifted), dim=-1)
-        # 配分比率: 把持=5.0, リフト完了=10.0
-        reward = ((reached & ~self.paid).float() * reached.new_tensor((5.0, 10.0), dtype=torch.float32)).sum(-1)
+        bonus = torch.tensor((grasp_bonus, lift_bonus), dtype=torch.float32, device=self.device)
+        reward = ((reached & ~self.paid).float() * bonus).sum(-1)
         reward = torch.where(self.started, reward, 0.0)
         self.paid = reached.clone()
         self.started[:] = True
