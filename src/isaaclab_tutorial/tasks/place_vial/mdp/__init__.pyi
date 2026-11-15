@@ -1,4 +1,8 @@
 __all__ = [
+    "BALL_LIFT_MIN_HEIGHT",
+    "BALL_LIFT_TARGET_HEIGHT",
+    "BALL_RADIUS",
+    "BALL_REST_HEIGHT",
     "approach_progress",
     "ball_dropped",
     "ball_lift_success",
@@ -40,4 +44,5 @@ from .observations import (
     wrist_rgb,
 )
 from .rewards import approach_progress, jaw_support_force, lift_progress, milestones, success
+from .task import BALL_LIFT_MIN_HEIGHT, BALL_LIFT_TARGET_HEIGHT, BALL_RADIUS, BALL_REST_HEIGHT
 from .terminations import ball_dropped, ball_lift_success

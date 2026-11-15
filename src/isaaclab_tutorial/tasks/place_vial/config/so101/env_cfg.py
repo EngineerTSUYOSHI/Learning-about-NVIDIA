@@ -440,7 +440,7 @@ class SO101SceneCfg(InteractiveSceneCfg):
             activate_contact_sensors=True,
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.23, 0.0, mdp.task.BALL_REST_HEIGHT),
+            pos=(0.23, 0.0, mdp.BALL_REST_HEIGHT),
             rot=(0.0, 0.0, 0.0, 1.0),
         ),
     )
