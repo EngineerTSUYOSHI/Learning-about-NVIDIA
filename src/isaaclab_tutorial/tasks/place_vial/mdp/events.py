@@ -98,12 +98,25 @@ class randomize_wrist_camera_mount(ManagerTermBase):
 
 # --- STEP 1: ボール把持＆持ち上げ用のリセットイベント ---
 class reset_ball_step1(ManagerTermBase):
-    """ロボットを初期姿勢にリセットし、机の上のランダムな位置にボールを配置する。"""
+    """ロボットとボールをリセットする。
+
+    * 通常スタート（確率 ``1 - grasp_prob``）: ロボットをホーム姿勢にリセットし、机の上のランダム位置にボールを配置する。
+    * 把持スタート（確率 ``grasp_prob``）: 机のすぐ上で爪がボールを挟んだ状態から開始し、持ち上げ動作（リフト）の学習を促進する。
+    """
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        from isaaclab_tutorial.tasks.place_vial.config.so101.env_cfg import WORKSHOP_INITIAL_JOINT_POSITION
+        from isaaclab_tutorial.tasks.place_vial.config.so101.env_cfg import (
+            GRASP_GRIPPER_POSITION,
+            WORKSHOP_GRASP_JOINT_POSITION,
+            WORKSHOP_INITIAL_JOINT_POSITION,
+            WORKSHOP_LIFT_MID_JOINT_POSITION,
+        )
+
         self.default_joint_pos = torch.tensor(WORKSHOP_INITIAL_JOINT_POSITION, device=env.device)
+        self.grasp_joint_pos = torch.tensor(WORKSHOP_GRASP_JOINT_POSITION, device=env.device)
+        self.lift_mid_joint_pos = torch.tensor(WORKSHOP_LIFT_MID_JOINT_POSITION, device=env.device)
+        self.grasp_gripper_target = float(GRASP_GRIPPER_POSITION)
 
     def __call__(
         self,
@@ -111,22 +124,49 @@ class reset_ball_step1(ManagerTermBase):
         env_ids: torch.Tensor | None,
         ball_pos_center: tuple[float, float] = (0.23, 0.0),
         ball_pos_noise: tuple[float, float] = (0.03, 0.04),
+        grasp_prob: float = 0.3,
     ) -> None:
-        from .task import BALL_REST_HEIGHT
+        from .progress import ball_lift_progress
+        from .task import BALL_LIFT_MIN_HEIGHT, BALL_REST_HEIGHT, grasp_center_w
 
         ids = _ids(env, env_ids)
         n = len(ids)
 
-        # 1. ロボット関節を初期ポーズ（ホーム位置）へリセット
+        # 各環境を「把持スタート」にするか「通常ホームスタート」にするかを確率 grasp_prob で決定
+        is_grasped = torch.rand(n, device=env.device) < grasp_prob if grasp_prob > 0.0 else torch.zeros(
+            n, dtype=torch.bool, device=env.device
+        )
+
+        # 1. ロボット関節角度・目標角度の設定
         robot = env.scene["robot"]
-        joint_pos = self.default_joint_pos.unsqueeze(0).expand(n, -1)
+        joint_pos = self.default_joint_pos.unsqueeze(0).expand(n, -1).clone()
+        joint_target = joint_pos.clone()
+
+        if is_grasped.any():
+            # 把持スタート環境: 机直上の把持ポーズ〜持ち上げ序盤ポーズの間をランダム補間し、少し関節ノイズを加える
+            blend = torch.empty((n, 1), device=env.device).uniform_(0.0, 0.35)
+            grasp_pose = torch.lerp(self.grasp_joint_pos.unsqueeze(0), self.lift_mid_joint_pos.unsqueeze(0), blend)
+            # XY方向の多様性を持たせるため shoulder_pan 等に微小なランダムノイズを付与
+            noise = torch.zeros_like(grasp_pose)
+            noise[:, 0].uniform_(-0.15, 0.15)  # shoulder_pan
+            noise[:, 1].uniform_(-0.03, 0.03)  # shoulder_lift
+            noise[:, 2].uniform_(-0.03, 0.03)  # elbow_flex
+            grasp_pose = grasp_pose + noise
+
+            # グリッパーの目標角度は閉じ方向（GRASP_GRIPPER_POSITION）に設定してボールをしっかり保持させる
+            grasp_target = grasp_pose.clone()
+            grasp_target[:, 5] = self.grasp_gripper_target
+
+            joint_pos = torch.where(is_grasped.unsqueeze(-1), grasp_pose, joint_pos)
+            joint_target = torch.where(is_grasped.unsqueeze(-1), grasp_target, joint_target)
+
         zeros = torch.zeros_like(joint_pos)
         robot.write_joint_position_to_sim_index(position=joint_pos, env_ids=ids)
         robot.write_joint_velocity_to_sim_index(velocity=zeros, env_ids=ids)
-        robot.set_joint_position_target_index(target=joint_pos, env_ids=ids)
+        robot.set_joint_position_target_index(target=joint_target, env_ids=ids)
         robot.set_joint_velocity_target_index(target=zeros, env_ids=ids)
 
-        # 2. 机の上の基準位置（±ランダムノイズ）にボールを配置
+        # 2. ボールの配置（通常スタートは机の上、把持スタートは両爪の中心座標へ配置）
         ball_pos = torch.zeros((n, 7), device=env.device)
         u_x = torch.empty(n, device=env.device).uniform_(-ball_pos_noise[0], ball_pos_noise[0])
         u_y = torch.empty(n, device=env.device).uniform_(-ball_pos_noise[1], ball_pos_noise[1])
@@ -142,16 +182,34 @@ class reset_ball_step1(ManagerTermBase):
         ball_world_pos = ball_pos.clone()
         ball_world_pos[:, :3] += env.scene.env_origins[ids]
 
+        if is_grasped.any():
+            # 順運動学（FK）を更新して、現在の関節角度における両爪先端の中心座標（ワールド座標系）を取得
+            env.sim.forward()
+            jaw_center_w = grasp_center_w(env)[ids]
+            # 机とのめり込みを防ぎ、かつ浮いている判定（BALL_LIFT_MIN_HEIGHT）を満たす最低高さを保証
+            min_z_w = env.scene.env_origins[ids, 2] + BALL_LIFT_MIN_HEIGHT + 0.002 + h
+            jaw_center_w[:, 2] = torch.maximum(jaw_center_w[:, 2], min_z_w)
+
+            ball_world_pos[is_grasped, :3] = jaw_center_w[is_grasped]
+            ball_pos[is_grasped, :3] = ball_world_pos[is_grasped, :3] - env.scene.env_origins[ids[is_grasped]]
+
         ball = env.scene["ball"]
         ball.write_root_pose_to_sim_index(root_pose=ball_world_pos, env_ids=ids)
         ball.write_root_velocity_to_sim_index(root_velocity=torch.zeros((n, 6), device=env.device), env_ids=ids)
 
-        # 3. 把持・リフト等の追跡フラグを初期化
-        for attr, shape in (
-            ("_so101_reset_grasped", (env.num_envs,)),
-            ("_so101_reset_lifted", (env.num_envs,)),
-            ("_so101_reset_ball_pose", (env.num_envs, 7)),
+        # 3. 把持・リフト等の追跡フラグを初期化（把持スタート環境は最初から grasped=True に設定）
+        for attr, shape, val in (
+            ("_so101_reset_grasped", (env.num_envs,), is_grasped),
+            ("_so101_reset_lifted", (env.num_envs,), False),
+            ("_so101_reset_ball_pose", (env.num_envs, 7), ball_pos),
         ):
             if not hasattr(env, attr):
-                setattr(env, attr, torch.zeros(shape, device=env.device, dtype=torch.bool if "grasp" in attr or "lift" in attr else torch.float32))
-            getattr(env, attr)[ids] = False if "grasp" in attr or "lift" in attr else ball_pos
+                dtype = torch.bool if "grasp" in attr or "lift" in attr else torch.float32
+                setattr(env, attr, torch.zeros(shape, device=env.device, dtype=dtype))
+            getattr(env, attr)[ids] = val
+
+        # 進捗トラッカーにも把持スタート状態を同期
+        progress = ball_lift_progress(env)
+        progress.grasped[ids] = is_grasped
+        progress.grasp_count[ids] = torch.where(is_grasped, progress.grasp_steps, 0)
+        progress.lifted[ids] = False

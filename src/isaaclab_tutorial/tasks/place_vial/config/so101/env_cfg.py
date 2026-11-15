@@ -57,6 +57,26 @@ WORKSHOP_INITIAL_JOINT_POSITION = (
     PREGRASP_GRIPPER_POSITION,
 )
 
+# 把持状態からスタートする際の基準関節角度（机のすぐ上でボールを挟んでいるポーズ）
+WORKSHOP_GRASP_JOINT_POSITION = (
+    0.09114071,
+    0.44803178,
+    -0.43491304 + math.radians(6.4),
+    1.15299133,
+    -1.64141933,
+    math.radians(10.0),
+)
+
+# 持ち上げ途中の基準関節角度（把持スタート時の高さバリエーション補間用）
+WORKSHOP_LIFT_MID_JOINT_POSITION = (
+    -0.03038024,
+    0.04142760,
+    -0.33287840 + math.radians(6.4),
+    1.23753429,
+    -1.64005544,
+    math.radians(10.0),
+)
+
 # The sim2real preset seats the robot base on the 35 mm tabletop, as on the real robot.
 BASE_SEATING_Z = 0.030081447775408447
 TABLETOP_Z = 0.035
@@ -596,11 +616,11 @@ class EventsCfg:
             "operation": "abs",
         },
     )
-    # 机の上にボールをランダム配置してロボットを初期姿勢にするリセット
+    # 机の上にボールをランダム配置してロボットを初期姿勢にするリセット（grasp_probの割合で把持状態からも開始）
     reset_ball = EventTerm(
         func=mdp.reset_ball_step1,
         mode="reset",
-        params={"ball_pos_center": (0.23, 0.0), "ball_pos_noise": (0.03, 0.04)},
+        params={"ball_pos_center": (0.23, 0.0), "ball_pos_noise": (0.03, 0.04), "grasp_prob": 0.3},
     )
 
 
@@ -772,6 +792,8 @@ class SO101VialEnvCfg(ManagerBasedRLEnvCfg):
             self.scene.num_envs = min(requested_num_envs, evaluation.EVALUATION_EPISODES)
         else:
             self.scene.num_envs = min(self.scene.num_envs, 16)
+        # 評価・再生モード（play）では全ての環境を初期姿勢（机上のボール）から開始する
+        self.events.reset_ball.params["grasp_prob"] = 0.0
         if not isinstance(self.events, Sim2RealEventsCfg):
             self.events.ball_material.params.update(
                 static_friction_range=(0.7, 0.7), dynamic_friction_range=(0.7, 0.7), restitution_range=(0.0, 0.0)
