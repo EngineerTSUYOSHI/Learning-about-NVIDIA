@@ -19,7 +19,6 @@ from isaaclab.utils.noise import UniformNoiseCfg
 from isaaclab_tasks.utils import preset
 from isaaclab_tasks.utils.presets import MultiBackendRendererCfg
 
-from isaaclab_tutorial.assets import VIAL_LABELED_USD
 from isaaclab_tutorial.tasks.place_vial import mdp
 
 from .env_cfg import (
@@ -68,18 +67,9 @@ class SO101CameraSceneCfg(SO101SceneCfg):
     # The Newton renderer only reads material color.
     robot_visual = VisualMaterialCfg(prim_path="{ENV_REGEX_NS}/Robot/Looks/material_a_d_printed", spawn=None)
     desk_visual = VisualMaterialCfg(prim_path="{ENV_REGEX_NS}/Desk/Looks/Wood", spawn=None)
-    rack_visual = VisualMaterialCfg(prim_path="{ENV_REGEX_NS}/Rack/WorkshopVisual/Looks/OmniPBR", spawn=None)
-    vial_body_visual = VisualMaterialCfg(prim_path="{ENV_REGEX_NS}/Vial/Looks/Vial_plastic", spawn=None)
-    vial_cap_visual = VisualMaterialCfg(prim_path="{ENV_REGEX_NS}/Vial/Looks/Vial_cap", spawn=None)
-    vial_label_visual = VisualMaterialCfg(prim_path="{ENV_REGEX_NS}/Vial/Looks/Label", spawn=None)
 
     def __post_init__(self):
         self.robot.spawn.hide_camera_housing = False
-        # --- 元の処理: ラベル付き小瓶USDへの差し替え ---
-        # self.vial.spawn.usd_path = str(VIAL_LABELED_USD)
-        # STEP 1対応: ボール（球体プリミティブ）時は上書きせずそのままカメラに青いボールを描画させる
-        if hasattr(self.vial.spawn, "usd_path"):
-            self.vial.spawn.usd_path = str(VIAL_LABELED_USD)
 
 
 @configclass
@@ -161,10 +151,6 @@ class CameraSim2RealEventsCfg(Sim2RealEventsCfg):
     # The printed-part material also binds the gripper; motors and pads keep their own materials.
     robot_color = _color_event("robot_visual", ((0.08, 0.04, 0.008), (1.0, 0.85, 0.85)))
     desk_color = _color_event("desk_visual", ((0.025, 0.025, 0.025), (0.60, 0.60, 0.60)))
-    rack_color = _color_event("rack_visual", ((0.06, 0.06, 0.02), (1.0, 0.95, 0.95)))
-    vial_body_color = _color_event("vial_body_visual", ((0.12, 0.12, 0.12), (0.95, 0.95, 0.95)))
-    vial_cap_color = _color_event("vial_cap_visual", ((0.02, 0.02, 0.02), (0.95, 0.95, 0.95)))
-    vial_label_color = _color_event("vial_label_visual", ((0.65, 0.65, 0.60), (1.0, 1.0, 1.0)))
     camera_mount = EventTerm(
         func=mdp.randomize_wrist_camera_mount,
         mode="reset",

@@ -1,24 +1,20 @@
 __all__ = [
-    "ResetFromDataset",
-    "reset_ball_step1",
     "approach_progress",
-    "lift_progress",
+    "ball_dropped",
+    "ball_lift_success",
     "encoder_joint_pos",
     "encoder_joint_target",
-    "held_goal",
     "jaw_contact_flags",
     "jaw_support_force",
     "joint_target",
+    "lift_progress",
     "milestones",
-    "placement_features",
-    "placement_success",
     "progress_flags",
     "randomize_encoder_bias",
     "randomize_joint_viscous_friction",
     "randomize_wrist_camera_mount",
+    "reset_ball_step1",
     "success",
-    "vial_dropped",
-    "vial_in_rack_frame",
     "wrist_rgb",
     "abnormal_robot_state",
     "body_state_b",
@@ -30,7 +26,6 @@ from isaaclab.envs.mdp import *
 from isaaclab_tasks.core.lift.mdp import abnormal_robot_state, body_state_b, out_of_bound
 
 from .events import (
-    ResetFromDataset,
     randomize_encoder_bias,
     randomize_joint_viscous_friction,
     randomize_wrist_camera_mount,
@@ -41,10 +36,8 @@ from .observations import (
     encoder_joint_target,
     jaw_contact_flags,
     joint_target,
-    placement_features,
     progress_flags,
-    vial_in_rack_frame,
     wrist_rgb,
 )
-from .rewards import approach_progress, held_goal, jaw_support_force, lift_progress, milestones, success
-from .terminations import placement_success, vial_dropped
+from .rewards import approach_progress, jaw_support_force, lift_progress, milestones, success
+from .terminations import ball_dropped, ball_lift_success

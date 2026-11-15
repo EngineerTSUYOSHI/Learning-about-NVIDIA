@@ -38,15 +38,11 @@ from isaaclab_tasks.utils import PresetCfg, preset
 
 from isaaclab_assets.robots import so101
 
-from isaaclab_tutorial.assets import DESK_USD, RACK_USD, RESET_DATASET, VIAL_USD
+from isaaclab_tutorial.assets import DESK_USD
 from isaaclab_tutorial.tasks.place_vial import mdp
-from isaaclab_tutorial.tasks.place_vial.reset.curriculum import ALL_PHASES, CANONICAL_START
 
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 ARM_JOINTS = JOINTS[:-1]
-
-TABLETOP_VIAL_HEADING_RANGE = (-0.35, 0.35)
-TABLETOP_VIAL_POSITION = (0.231, -0.017, 0.06)
 
 PREGRASP_GRIPPER_POSITION = math.radians(14.64)
 GRASP_GRIPPER_POSITION = math.radians(-8.9)
@@ -108,24 +104,11 @@ def _spawn_usd_with_contact_material(
     **kwargs,
 ):
     """Spawn a USD asset and bind the workshop contact material to all of its colliders."""
-    from pxr import Gf, Sdf
-
     from isaaclab.sim.spawners.from_files.from_files import spawn_from_usd
 
     prim = spawn_from_usd(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
     _bind_workshop_contact_material(prim, prim_path)
-    if getattr(cfg, "randomize_diameters", False):
-        prim.CreateAttribute("tutorial:bodyDiameterRange", Sdf.ValueTypeNames.Float2).Set(Gf.Vec2f(0.0284, 0.0294))
-        prim.CreateAttribute("tutorial:capDiameterRange", Sdf.ValueTypeNames.Float2).Set(Gf.Vec2f(0.0349, 0.0359))
     return prim
-
-
-@configclass
-class VialSpawnCfg(sim_utils.UsdFileCfg):
-    """Measured vial; optional per-world diameter variation during Newton construction."""
-
-    func = _spawn_usd_with_contact_material
-    randomize_diameters: bool = False
 
 
 # --- STEP 1: ボール（球体プリミティブ）のスポーン設定 ---
@@ -177,32 +160,6 @@ def _initialize_contacts(_event: PhysicsEvent) -> None:
     """Apply the workshop-validated contact model to every Newton shape."""
     sim = sim_utils.SimulationContext.instance()
     builder = sim.get_or_create_backend(NewtonBuilderCfg(physics_cfg=sim.cfg.physics))
-
-    vial_prim = sim.stage.GetPrimAtPath("/World/envs/env_0/Vial")
-    body_range = vial_prim.GetAttribute("tutorial:bodyDiameterRange").Get() if vial_prim else None
-    cap_range = vial_prim.GetAttribute("tutorial:capDiameterRange").Get() if vial_prim else None
-    if body_range is not None and cap_range is not None:
-        samples = {}
-        for index, label in enumerate(builder.shape_label):
-            if "/Vial/" not in label:
-                continue
-            world = builder.shape_world[index]
-            if world not in samples:
-                u, v = torch.rand(2).tolist()
-                samples[world] = (
-                    body_range[0] + u * (body_range[1] - body_range[0]),
-                    cap_range[0] + v * (cap_range[1] - cap_range[0]),
-                )
-            body, cap = samples[world]
-            scale = list(builder.shape_scale[index])
-            name = label.rsplit("/", 1)[-1]
-            if name in ("body_collider", "bottom_collider", "cap_collider"):
-                scale[0] = (cap if name == "cap_collider" else body) / 2
-            elif name in ("Mesh", "Mesh_001", "Mesh_002", "Label"):
-                factor = body / 0.0289 if name in ("Mesh_002", "Label") else cap / 0.0354
-                scale[0] *= factor
-                scale[1] *= factor
-            builder.shape_scale[index] = tuple(scale)
 
     num_shapes = len(builder.shape_body)
     for shape_index in range(num_shapes):
@@ -481,19 +438,15 @@ class SO101SceneCfg(InteractiveSceneCfg):
         soft_joint_pos_limit_factor=0.98,
     )
 
-    # --- 元の定義（小瓶: Vial と ラック: Rack） ---
-    # vial = RigidObjectCfg(...)
-    # rack = RigidObjectCfg(...)
-
-    # --- STEP 1: ボールオブジェクト（小瓶の代替）とラックの除外 ---
-    vial = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Vial",
+    # ボールオブジェクト（球体プリミティブ）
+    ball = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Ball",
         spawn=BallSpawnCfg(
             radius=mdp.task.BALL_RADIUS,
             activate_contact_sensors=True,
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.23, 0.0, mdp.task.VIAL_REST_HEIGHT),
+            pos=(0.23, 0.0, mdp.task.BALL_REST_HEIGHT),
             rot=(0.0, 0.0, 0.0, 1.0),
         ),
     )
@@ -524,17 +477,25 @@ class SO101SceneCfg(InteractiveSceneCfg):
     fixed_jaw_contact = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/gripper", history_length=4)
     moving_jaw_contact = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/moving_jaw_so101_v1",
-        filter_prim_paths_expr=["{ENV_REGEX_NS}/Vial"],
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Ball"],
         history_length=4,
     )
-    # --- Original vial_rack_contact commented out (Rack removed for Step 1) ---
-    # vial_rack_contact = ContactSensorCfg(
-    #     prim_path="{ENV_REGEX_NS}/Vial",
-    #     filter_prim_paths_expr=["{ENV_REGEX_NS}/Rack"],
-    #     history_length=4,
-    # )
-    fixed_jaw_support = preset(default=None, sim2real=_jaw_support_sensor("gripper"))
-    moving_jaw_support = preset(default=None, sim2real=_jaw_support_sensor("moving_jaw_so101_v1"))
+    fixed_jaw_support = preset(
+        default=ContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/gripper",
+            filter_prim_paths_expr=["{ENV_REGEX_NS}/Desk"],
+            history_length=1,
+        ),
+        sim2real=_jaw_support_sensor("gripper"),
+    )
+    moving_jaw_support = preset(
+        default=ContactSensorCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/moving_jaw_so101_v1",
+            filter_prim_paths_expr=["{ENV_REGEX_NS}/Desk"],
+            history_length=1,
+        ),
+        sim2real=_jaw_support_sensor("moving_jaw_so101_v1"),
+    )
 
     light = AssetBaseCfg(
         prim_path="/World/Light",
@@ -592,13 +553,11 @@ class PolicyStateGroupCfg(ObsGroup):
             "base_asset_cfg": SceneEntityCfg("robot"),
         },
     )
-    vial = ObsTerm(
+    ball = ObsTerm(
         func=mdp.body_state_b,
-        params={"body_asset_cfg": SceneEntityCfg("vial"), "base_asset_cfg": SceneEntityCfg("robot")},
+        params={"body_asset_cfg": SceneEntityCfg("ball"), "base_asset_cfg": SceneEntityCfg("robot")},
     )
-    vial_in_rack = ObsTerm(func=mdp.vial_in_rack_frame)
-    placement = ObsTerm(func=mdp.placement_features)
-    # Latched milestones make the once-per-episode milestone rewards Markov.
+    # 進捗フラグ（把持・リフトのマルコフ性維持用）
     progress = ObsTerm(func=mdp.progress_flags)
 
     def __post_init__(self):
@@ -621,33 +580,29 @@ class ObservationsCfg:
 
 @configclass
 class EventsCfg:
-    """Task-horizon resets from the physics-validated dataset plus modest vial variation."""
+    """ボールの物理パラメータ設定およびエピソードリセット設定。"""
 
-    vial_material = EventTerm(
+    ball_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("vial"),
+            "asset_cfg": SceneEntityCfg("ball"),
             "static_friction_range": preset(default=VIAL_FRICTION_RANGE, physx=PHYSX_VIAL_FRICTION_RANGE),
             "dynamic_friction_range": preset(default=VIAL_FRICTION_RANGE, physx=PHYSX_VIAL_FRICTION_RANGE),
             "restitution_range": (0.0, 0.02),
             "num_buckets": 32,
         },
     )
-    vial_mass = EventTerm(
+    ball_mass = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("vial"),
-            # Newton cannot reliably infer mass from the detailed mesh.
+            "asset_cfg": SceneEntityCfg("ball"),
             "mass_distribution_params": (0.015, 0.025),
             "operation": "abs",
         },
     )
-    # --- 元の処理（事前に作成された小瓶タスク用データセットからのリセット） ---
-    # reset_from_dataset = EventTerm(...)
-
-    # --- STEP 1: 机の上にボールをランダム配置してロボットを初期姿勢にするリセット ---
+    # 机の上にボールをランダム配置してロボットを初期姿勢にするリセット
     reset_ball = EventTerm(
         func=mdp.reset_ball_step1,
         mode="reset",
@@ -674,9 +629,8 @@ def _material_event(asset_cfg: SceneEntityCfg, friction_range: tuple[float, floa
 class Sim2RealEventsCfg(EventsCfg):
     """Per-episode contact, motor, calibration and placement variation for robot transfer."""
 
-    vial_material = _material_event(SceneEntityCfg("vial"), (0.2, 1.3))
+    ball_material = _material_event(SceneEntityCfg("ball"), (0.2, 1.3))
     jaw_material = _material_event(SceneEntityCfg("robot", body_names=["gripper", "moving_jaw_so101_v1"]), (0.2, 1.3))
-    rack_material = _material_event(SceneEntityCfg("rack"), (0.2, 1.0))
     support_material = _material_event(SceneEntityCfg("support"), (0.3, 1.3))
     gripper_gains = EventTerm(
         func=mdp.randomize_actuator_gains,
@@ -719,19 +673,8 @@ class Sim2RealEventsCfg(EventsCfg):
     encoder_bias = EventTerm(func=mdp.randomize_encoder_bias, mode="reset", params={"bound": 0.01})
 
     def __post_init__(self):
-        self.vial_mass.mode = "reset"
-        self.vial_mass.params["mass_distribution_params"] = (0.012, 0.030)
-        # --- Original (Dataset resets) ---
-        if hasattr(self, "reset_from_dataset"):
-            self.reset_from_dataset.params.update(
-                phase_weights=CANONICAL_START,
-                home_position_noise=0.02,
-                home_rack_clearance=0.001,
-                home_rack_position_noise=0.005,
-                home_rack_yaw_noise=math.radians(5),
-                home_heading_noise=math.radians(15),
-                support_height_range=(0.0, 0.004),
-            )
+        self.ball_mass.mode = "reset"
+        self.ball_mass.params["mass_distribution_params"] = (0.012, 0.030)
 
 
 @configclass
@@ -743,13 +686,13 @@ class RewardsCfg:
         func=mdp.approach_progress, weight=1.0, params={"height_offset": 0.0}
     )
     # 持ち上げシェーピング報酬: ボールを浮かせている間、目標高さに近づくほど連続的に加点
-    held_goal = RewTerm(func=mdp.lift_progress, weight=1.0)
+    lift_progress = RewTerm(func=mdp.lift_progress, weight=1.0)
     # マイルストーン報酬: 把持達成(+5.0) および 目標高さ到達(+10.0) の1回限りボーナス
     milestones = RewTerm(func=mdp.milestones, weight=1.0)
     # 完了ボーナス: 目標高さ以上で安定キープできた時の成功報酬
     success = RewTerm(func=mdp.success, weight=200.0)
-    vial_lost = RewTerm(
-        func=mdp.is_terminated_term, weight=-50.0, params={"term_keys": ["vial_out_of_bounds", "vial_dropped"]}
+    ball_lost = RewTerm(
+        func=mdp.is_terminated_term, weight=-50.0, params={"term_keys": ["ball_out_of_bounds", "ball_dropped"]}
     )
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.002)
     joint_velocity = RewTerm(func=mdp.joint_vel_l2, weight=-0.0002)
@@ -760,13 +703,13 @@ class RewardsCfg:
 
 @configclass
 class TerminationsCfg:
-    success = DoneTerm(func=mdp.placement_success)
-    vial_dropped = DoneTerm(func=mdp.vial_dropped)
-    # The robot base frame is yawed +90 degrees, so these bounds are 0.5 m to its sides and 0.62 m ahead/behind.
-    vial_out_of_bounds = DoneTerm(
+    success = DoneTerm(func=mdp.ball_lift_success)
+    ball_dropped = DoneTerm(func=mdp.ball_dropped)
+    # ロボットのベース座標系はZ軸周りに+90度回転しているため、机の範囲外を判定
+    ball_out_of_bounds = DoneTerm(
         func=mdp.out_of_bound,
         params={
-            "asset_cfg": SceneEntityCfg("vial"),
+            "asset_cfg": SceneEntityCfg("ball"),
             "in_bound_range": {"x": (-0.55, 0.45), "y": (-0.62, 0.62), "z": (-0.01, 1.0)},
         },
     )
@@ -835,12 +778,8 @@ class SO101VialEnvCfg(ManagerBasedRLEnvCfg):
             self.scene.num_envs = min(requested_num_envs, evaluation.EVALUATION_EPISODES)
         else:
             self.scene.num_envs = min(self.scene.num_envs, 16)
-        # --- Original (Reset from dataset in play mode) ---
-        if hasattr(self.events, "reset_from_dataset"):
-            self.events.reset_from_dataset.params["sequential"] = True
-            self.events.reset_from_dataset.params["phase_weights"] = CANONICAL_START
         if not isinstance(self.events, Sim2RealEventsCfg):
-            self.events.vial_material.params.update(
+            self.events.ball_material.params.update(
                 static_friction_range=(0.7, 0.7), dynamic_friction_range=(0.7, 0.7), restitution_range=(0.0, 0.0)
             )
-            self.events.vial_mass.params["mass_distribution_params"] = (0.020, 0.020)
+            self.events.ball_mass.params["mass_distribution_params"] = (0.020, 0.020)

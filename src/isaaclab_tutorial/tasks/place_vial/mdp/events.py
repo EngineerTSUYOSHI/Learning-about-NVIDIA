@@ -1,18 +1,13 @@
-"""Event terms: dataset resets, and the joint, encoder and camera randomization Isaac Lab does not provide."""
+"""イベント処理: ボールのランダム配置リセット、および関節・エンコーダ・カメラのランダマイズ。"""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
 
 from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
-from isaaclab.utils.math import combine_frame_transforms, quat_from_euler_xyz, quat_mul, subtract_frame_transforms
-
-from isaaclab_tutorial.tasks.place_vial.reset.dataset import load_reset_dataset
-
-from .geometry import tabletop_vial_overlaps_rack
+from isaaclab.utils.math import combine_frame_transforms, quat_from_euler_xyz, subtract_frame_transforms
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -25,120 +20,6 @@ def _ids(env: ManagerBasedRLEnv, env_ids: torch.Tensor | slice | None) -> torch.
     if isinstance(env_ids, slice):
         return torch.arange(env.num_envs, device=env.device)[env_ids]
     return env_ids
-
-
-def _yaw_quat(angle: torch.Tensor) -> torch.Tensor:
-    zeros = torch.zeros_like(angle)
-    return quat_from_euler_xyz(zeros, zeros, angle)
-
-
-def phase_balanced_row_weights(phase: torch.Tensor, phase_weights: Sequence[float]) -> torch.Tensor:
-    """Spread each phase's sampling weight uniformly over that phase's dataset rows."""
-    weights = torch.as_tensor(phase_weights, device=phase.device, dtype=torch.float32)
-    counts = torch.bincount(phase, minlength=len(weights))
-    if len(counts) != len(weights):
-        raise ValueError(f"phase_weights must contain exactly {len(counts)} values")
-    if ((weights > 0) & (counts == 0)).any():
-        raise ValueError("phase_weights request a phase with no dataset rows")
-    return weights[phase] / counts.clamp_min(1)[phase]
-
-
-class ResetFromDataset(ManagerTermBase):
-    """Reset robot, vial and rack to physics-validated dataset rows, sampled by phase or in order.
-
-    Home rows (phase 0) can be perturbed: vial position and heading, rack position and yaw, and the mat height. A
-    vial that would overlap the rack is redrawn, falling back to its dataset pose. Mid-task rows are not perturbed.
-    """
-
-    def __init__(self, cfg: EventTermCfg, env: ManagerBasedRLEnv):
-        super().__init__(cfg, env)
-        self.states = load_reset_dataset(cfg.params["dataset_path"], device=env.device)["states"]
-        self.row_weights = phase_balanced_row_weights(self.states["phase"], cfg.params["phase_weights"])
-        self.sequential_rows = self.row_weights.nonzero().flatten()
-        self.cursor = 0
-
-    def __call__(
-        self,
-        env: ManagerBasedRLEnv,
-        env_ids: torch.Tensor | None,
-        dataset_path: str,
-        phase_weights: Sequence[float],
-        sequential: bool = False,
-        home_position_noise: float = 0.0,
-        home_heading_noise: float = 0.0,
-        home_rack_clearance: float = 0.0,
-        home_rack_position_noise: float = 0.0,
-        home_rack_yaw_noise: float = 0.0,
-        support_height_range: tuple[float, float] = (0.0, 0.0),
-    ) -> None:
-        ids = _ids(env, env_ids)
-        n = len(ids)
-        if sequential:
-            rows = self.sequential_rows[(torch.arange(n, device=env.device) + self.cursor) % len(self.sequential_rows)]
-            self.cursor = (self.cursor + n) % len(self.sequential_rows)
-        else:
-            rows = torch.multinomial(self.row_weights, n, replacement=True)
-        states = {name: value[rows] for name, value in self.states.items()}
-        home = (states["phase"] == 0)[:, None]
-
-        robot = env.scene["robot"]
-        zeros = torch.zeros_like(states["joint_position"])
-        robot.write_joint_position_to_sim_index(position=states["joint_position"], env_ids=ids)
-        robot.write_joint_velocity_to_sim_index(velocity=zeros, env_ids=ids)
-        robot.set_joint_position_target_index(target=states["joint_target"], env_ids=ids)
-        robot.set_joint_velocity_target_index(target=zeros, env_ids=ids)
-
-        def uniform(shape, bound):
-            return torch.empty(shape, device=env.device).uniform_(-bound, bound) * home
-
-        rack_pose = env.scene["rack"].data.default_root_pose.torch[ids].clone()
-        rack_pose[:, :2] += uniform((n, 2), home_rack_position_noise)
-        rack_pose[:, 3:] = quat_mul(_yaw_quat(uniform((n, 1), home_rack_yaw_noise)[:, 0]), rack_pose[:, 3:])
-        vial_pose = states["vial_pose"].clone()
-        vial_pose[:, 3:] = quat_mul(_yaw_quat(uniform((n, 1), home_heading_noise)[:, 0]), vial_pose[:, 3:])
-        vial_pose[:, :2] += uniform((n, 2), home_position_noise)
-        for _ in range(16):
-            redraw = tabletop_vial_overlaps_rack(vial_pose, rack_pose, home_rack_clearance) & home[:, 0]
-            if not redraw.any():
-                break
-            vial_pose[redraw, :2] = states["vial_pose"][redraw, :2] + uniform((n, 2), home_position_noise)[redraw]
-        else:
-            vial_pose[redraw, :2] = states["vial_pose"][redraw, :2]
-            rack_pose[redraw] = env.scene["rack"].data.default_root_pose.torch[ids[redraw]]
-
-        if "support" in env.scene.keys():  # noqa: SIM118 (InteractiveScene has no __contains__)
-            # The 5 mm kinematic mat overlaps the desk; its exposed height spans bare desk to full mat.
-            height = torch.empty(n, device=env.device).uniform_(*support_height_range) * home[:, 0]
-            if not hasattr(env, "_so101_support_height"):
-                env._so101_support_height = torch.zeros(env.num_envs, device=env.device)
-            env._so101_support_height[ids] = height
-            support = env.scene["support"]
-            support_pose = support.data.default_root_pose.torch[ids].clone()
-            support_pose[:, 2] += height
-            support_pose[:, :3] += env.scene.env_origins[ids]
-            support.write_root_pose_to_sim_index(root_pose=support_pose, env_ids=ids)
-            vial_pose[:, 2] += height
-            rack_pose[:, 2] += height
-
-        # Read by the success term (restored milestones) and by evaluation (initial conditions).
-        for name, value in (
-            ("row", rows),
-            ("grasped", states["grasped"]),
-            ("lifted", states["lifted"]),
-            ("vial_pose", vial_pose),
-            ("rack_pose", rack_pose),
-        ):
-            attribute = f"_so101_reset_{name}"
-            if not hasattr(env, attribute):
-                setattr(env, attribute, value.new_zeros((env.num_envs, *value.shape[1:])))
-            getattr(env, attribute)[ids] = value
-        for name, pose in (("vial", vial_pose), ("rack", rack_pose)):
-            pose = pose.clone()
-            pose[:, :3] += env.scene.env_origins[ids]
-            env.scene[name].write_root_pose_to_sim_index(root_pose=pose, env_ids=ids)
-            env.scene[name].write_root_velocity_to_sim_index(
-                root_velocity=torch.zeros(n, 6, device=env.device), env_ids=ids
-            )
 
 
 class randomize_joint_viscous_friction(ManagerTermBase):
@@ -231,7 +112,7 @@ class reset_ball_step1(ManagerTermBase):
         ball_pos_center: tuple[float, float] = (0.23, 0.0),
         ball_pos_noise: tuple[float, float] = (0.03, 0.04),
     ) -> None:
-        from .task import VIAL_REST_HEIGHT
+        from .task import BALL_REST_HEIGHT
 
         ids = _ids(env, env_ids)
         n = len(ids)
@@ -254,14 +135,14 @@ class reset_ball_step1(ManagerTermBase):
 
         ball_pos[:, 0] = ball_pos_center[0] + u_x
         ball_pos[:, 1] = ball_pos_center[1] + u_y
-        ball_pos[:, 2] = VIAL_REST_HEIGHT + h
+        ball_pos[:, 2] = BALL_REST_HEIGHT + h
         ball_pos[:, 6] = 1.0  # 単位クォータニオン (XYZW: 0, 0, 0, 1)
 
         # 環境原点のオフセットを適用
         ball_world_pos = ball_pos.clone()
         ball_world_pos[:, :3] += env.scene.env_origins[ids]
 
-        ball = env.scene["vial"]
+        ball = env.scene["ball"]
         ball.write_root_pose_to_sim_index(root_pose=ball_world_pos, env_ids=ids)
         ball.write_root_velocity_to_sim_index(root_velocity=torch.zeros((n, 6), device=env.device), env_ids=ids)
 
@@ -269,7 +150,7 @@ class reset_ball_step1(ManagerTermBase):
         for attr, shape in (
             ("_so101_reset_grasped", (env.num_envs,)),
             ("_so101_reset_lifted", (env.num_envs,)),
-            ("_so101_reset_vial_pose", (env.num_envs, 7)),
+            ("_so101_reset_ball_pose", (env.num_envs, 7)),
         ):
             if not hasattr(env, attr):
                 setattr(env, attr, torch.zeros(shape, device=env.device, dtype=torch.bool if "grasp" in attr or "lift" in attr else torch.float32))
