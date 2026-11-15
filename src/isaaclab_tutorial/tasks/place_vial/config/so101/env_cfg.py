@@ -38,7 +38,7 @@ from isaaclab_tasks.utils import PresetCfg, preset
 
 from isaaclab_assets.robots import so101
 
-from isaaclab_tutorial.assets import DESK_USD
+from isaaclab_tutorial.assets import BALL_USD, DESK_USD
 from isaaclab_tutorial.tasks.place_vial import mdp
 
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
@@ -111,25 +111,15 @@ def _spawn_usd_with_contact_material(
     return prim
 
 
-# --- STEP 1: ボール（球体プリミティブ）のスポーン設定 ---
-@clone
-def _spawn_ball(prim_path: str, cfg: Any, translation=None, orientation=None, **kwargs):
-    prim = sim_utils.spawn_sphere(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
-    _bind_workshop_contact_material(prim, prim_path)
-    return prim
-
-
+# --- STEP 1: ボールのスポーン設定（assets/workshop/ball.usda を読み込む） ---
+# ※補足: ボールのような単純な球体であれば、外部のUSDファイルを用意しなくても
+# sim_utils.SphereCfg(radius=..., rigid_props=..., collision_props=...) を使って
+# コード上から直接プリミティブ形状として生成する方法もあります。
 @configclass
-class BallSpawnCfg(sim_utils.SphereCfg):
-    """STEP 1 ボール把持用の剛体球体設定（接触マテリアル・青色プレビュー付き）"""
+class BallSpawnCfg(sim_utils.UsdFileCfg):
+    """assets/workshop/ball.usda を読み込み、接触マテリアルをバインドする設定。"""
 
-    func = _spawn_ball
-    radius: float = mdp.task.BALL_RADIUS
-    rigid_props: sim_utils.UsdPhysicsRigidBodyCfg = sim_utils.UsdPhysicsRigidBodyCfg()
-    collision_props: sim_utils.UsdPhysicsCollisionCfg = sim_utils.UsdPhysicsCollisionCfg()
-    mass_props: sim_utils.MassCfg = sim_utils.MassCfg(mass=0.02)
-    physics_material: sim_utils.RigidBodyMaterialCfg = WORKSHOP_CONTACT_MATERIAL
-    visual_material: sim_utils.PreviewSurfaceCfg = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.45, 0.95))
+    func = _spawn_usd_with_contact_material
 
 
 @clone
@@ -438,11 +428,15 @@ class SO101SceneCfg(InteractiveSceneCfg):
         soft_joint_pos_limit_factor=0.98,
     )
 
-    # ボールオブジェクト（球体プリミティブ）
+    # ボールオブジェクト（assets/workshop/ball.usda から読み込み）
     ball = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Ball",
         spawn=BallSpawnCfg(
-            radius=mdp.task.BALL_RADIUS,
+            usd_path=str(BALL_USD),
+            rigid_props=preset(
+                default=None,
+                physx=PhysxRigidBodyCfg(solver_position_iteration_count=PHYSX_SOLVER_POSITION_ITERATIONS),
+            ),
             activate_contact_sensors=True,
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
