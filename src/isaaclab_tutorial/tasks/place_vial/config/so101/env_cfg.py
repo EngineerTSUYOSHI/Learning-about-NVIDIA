@@ -44,7 +44,15 @@ from isaaclab_tutorial.tasks.place_vial import mdp
 JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 ARM_JOINTS = JOINTS[:-1]
 
-PREGRASP_GRIPPER_POSITION = math.radians(14.64)
+# ボール直径のランダム化設定 [m]（環境ごとに起動時に割り当てられ、その環境では学習中固定される）
+# ランダム化する場合の例: BALL_DIAMETER_RANGE = (0.01, 0.06), BALL_DIAMETER_STEP = 0.005（1cm〜6cmの5mm刻み）
+BALL_DIAMETER_RANGE: tuple[float, float] = (0.05, 0.05)  # 今回は 5cm 固定
+BALL_DIAMETER_STEP: float = 0.005
+# シミュレーション起動時に各環境へ割り当てられたボール半径 [m] を保持するリスト
+_ENV_BALL_RADII: list[float] = []
+
+# 直径5cmボールが無理なく爪の間に入るよう、初期開き角度を少し広め（30度）に設定
+PREGRASP_GRIPPER_POSITION = math.radians(30.0)
 GRASP_GRIPPER_POSITION = math.radians(-8.9)
 RELEASE_GRIPPER_POSITION = math.radians(36.97)
 
@@ -143,6 +151,79 @@ class BallSpawnCfg(sim_utils.UsdFileCfg):
 
 
 @clone
+def _spawn_open_box(
+    prim_path: str,
+    cfg: OpenBoxSpawnCfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+):
+    """プリミティブ（立方体5枚）を組み合わせて上開きの箱（カゴ）を生成する。"""
+    from pxr import Gf, Sdf, UsdGeom, UsdPhysics, UsdShade
+
+    import isaaclab.sim as sim_utils_inner
+
+    stage = sim_utils_inner.get_current_stage()
+    root_xform = UsdGeom.Xform.Define(stage, prim_path)
+    root_prim = root_xform.GetPrim()
+    if translation is not None:
+        root_xform.AddTranslateOp().Set(Gf.Vec3d(*translation))
+    if orientation is not None:
+        # orientationはWXYZまたはXYZWに注意: sim_utilsのSpawnersと同じく(w, x, y, z)で受け取る
+        root_xform.AddOrientOp().Set(Gf.Quatf(orientation[0], orientation[1], orientation[2], orientation[3]))
+
+    # 静的・キネマティック剛体として定義（ボールが当たっても箱自体は動かない）
+    rb_api = UsdPhysics.RigidBodyAPI.Apply(root_prim)
+    rb_api.CreateKinematicEnabledAttr(True)
+    mass_api = UsdPhysics.MassAPI.Apply(root_prim)
+    mass_api.CreateMassAttr(1.0)
+
+    # 見た目のマテリアル（落ち着いた緑系の箱）
+    looks_path = f"{prim_path}/Looks"
+    UsdGeom.Scope.Define(stage, looks_path)
+    mat_path = f"{looks_path}/BoxMaterial"
+    mat = UsdShade.Material.Define(stage, mat_path)
+    shader = UsdShade.Shader.Define(stage, f"{mat_path}/Shader")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*cfg.color))
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.6)
+    mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+
+    s = cfg.size
+    h = cfg.height
+    t = cfg.wall_thickness
+    # 底板1枚 + 四方の壁4枚（各Cubeは size=1.0 にして scale で寸法を指定）
+    parts = (
+        ("floor", (0.0, 0.0, 0.5 * t), (s, s, t)),
+        ("wall_px", (0.5 * s - 0.5 * t, 0.0, 0.5 * h), (t, s, h)),
+        ("wall_nx", (-0.5 * s + 0.5 * t, 0.0, 0.5 * h), (t, s, h)),
+        ("wall_py", (0.0, 0.5 * s - 0.5 * t, 0.5 * h), (s - 2.0 * t, t, h)),
+        ("wall_ny", (0.0, -0.5 * s + 0.5 * t, 0.5 * h), (s - 2.0 * t, t, h)),
+    )
+    for name, pos, scale in parts:
+        cube = UsdGeom.Cube.Define(stage, f"{prim_path}/{name}")
+        cube.CreateSizeAttr(1.0)
+        cube.AddTranslateOp().Set(Gf.Vec3d(*pos))
+        cube.AddScaleOp().Set(Gf.Vec3f(*scale))
+        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+        UsdShade.MaterialBindingAPI.Apply(cube.GetPrim()).Bind(mat)
+
+    _bind_workshop_contact_material(root_prim, prim_path)
+    return root_prim
+
+
+@configclass
+class OpenBoxSpawnCfg(sim_utils.SpawnerCfg):
+    """プリミティブ形状で上開きの箱（11cm x 11cm x 高さ5cm）を生成する設定。"""
+
+    func = _spawn_open_box
+    size: float = 0.11
+    height: float = 0.05
+    wall_thickness: float = 0.006
+    color: tuple[float, float, float] = (0.15, 0.55, 0.30)
+
+
+@clone
 def _spawn_support(prim_path, cfg, translation=None, orientation=None, **kwargs):
     from pxr import Sdf
 
@@ -166,10 +247,48 @@ class SupportSpawnCfg(sim_utils.CuboidCfg):
     torsional_friction_range: tuple[float, float] = (0.001, 0.005)
 
 
+def _sample_ball_radii(num_worlds: int, diameter_range: tuple[float, float], step: float) -> list[float]:
+    """指定範囲・刻み幅から均等にボール半径リスト [m] を生成してシャッフルする。"""
+    lo, hi = diameter_range
+    if hi <= lo or step <= 0.0:
+        return [0.5 * lo] * num_worlds
+    count = max(1, int(round((hi - lo) / step)) + 1)
+    candidates = [0.5 * min(hi, lo + i * step) for i in range(count)]
+    perm = torch.randperm(num_worlds).tolist()
+    return [candidates[idx % len(candidates)] for idx in perm]
+
+
 def _initialize_contacts(_event: PhysicsEvent) -> None:
-    """Apply the workshop-validated contact model to every Newton shape."""
+    """Apply the workshop-validated contact model and per-env ball sizes to every Newton shape."""
+    from pxr import Gf, UsdGeom
+
     sim = sim_utils.SimulationContext.instance()
     builder = sim.get_or_create_backend(NewtonBuilderCfg(physics_cfg=sim.cfg.physics))
+
+    # ボールサイズの環境ごとの割り当て（物理コライダとUSD見た目メッシュの両方を同期スケール）
+    num_worlds = max((w for w in builder.shape_world), default=0) + 1
+    radii = _sample_ball_radii(num_worlds, BALL_DIAMETER_RANGE, BALL_DIAMETER_STEP)
+    _ENV_BALL_RADII.clear()
+    _ENV_BALL_RADII.extend(radii)
+
+    base_radius = mdp.BALL_RADIUS  # ball.usda の基準半径 (0.025 m)
+    if any(abs(r - base_radius) > 1.0e-6 for r in radii):
+        for index, label in enumerate(builder.shape_label):
+            if "/Ball/" not in label:
+                continue
+            world = builder.shape_world[index]
+            factor = radii[world] / base_radius
+            scale = list(builder.shape_scale[index])
+            builder.shape_scale[index] = tuple(s * factor for s in scale)
+        # 視覚（USD）側のスケールも各環境ごとに合わせる
+        for world, r in enumerate(radii):
+            factor = r / base_radius
+            geom_prim = sim.stage.GetPrimAtPath(f"/World/envs/env_{world}/Ball/Geometry")
+            if geom_prim and geom_prim.IsValid():
+                xform = UsdGeom.Xformable(geom_prim)
+                scale_ops = [op for op in xform.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeScale]
+                scale_op = scale_ops[0] if scale_ops else xform.AddScaleOp()
+                scale_op.Set(Gf.Vec3f(factor, factor, factor))
 
     num_shapes = len(builder.shape_body)
     for shape_index in range(num_shapes):
@@ -440,7 +559,8 @@ class SO101SceneCfg(InteractiveSceneCfg):
     robot = SO101_CFG.replace(
         prim_path="{ENV_REGEX_NS}/Robot",
         init_state=SO101_CFG.init_state.replace(
-            pos=preset(default=(-0.05, 0.0, 0.0), sim2real=(-0.05, 0.0, BASE_HEIGHT_CORRECTION)),
+            # 背面側の箱も机の上に収まるよう、ロボットを机中央寄り（x=0.10）へ配置
+            pos=preset(default=(0.10, 0.0, 0.0), sim2real=(0.10, 0.0, BASE_HEIGHT_CORRECTION)),
             # +90 degrees about world Z (XYZW).
             rot=(0.0, 0.0, 0.7071068, 0.7071068),
             joint_pos=dict(zip(JOINTS, WORKSHOP_INITIAL_JOINT_POSITION, strict=True)),
@@ -448,7 +568,7 @@ class SO101SceneCfg(InteractiveSceneCfg):
         soft_joint_pos_limit_factor=0.98,
     )
 
-    # ボールオブジェクト（assets/workshop/ball.usda から読み込み）
+    # 直径5cmのボールオブジェクト（assets/workshop/ball.usda から読み込み）
     ball = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Ball",
         spawn=BallSpawnCfg(
@@ -460,7 +580,19 @@ class SO101SceneCfg(InteractiveSceneCfg):
             activate_contact_sensors=True,
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            pos=(0.23, 0.0, mdp.BALL_REST_HEIGHT),
+            # ロボットの爪の下（前方約26cm）に配置
+            pos=(0.36, 0.0, mdp.BALL_REST_HEIGHT),
+            rot=(0.0, 0.0, 0.0, 1.0),
+        ),
+    )
+
+    # プリミティブ生成の上開き箱（11cm x 11cm x 高さ5cm、ロボットの背面側に配置）
+    box = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Box",
+        spawn=OpenBoxSpawnCfg(size=0.11, height=0.05, wall_thickness=0.006),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            # ロボット(0.10, 0.0)から見て背面側（斜め後ろ: shoulder_panの可動域内で無理なく届く位置）
+            pos=(-0.04, 0.12, 0.035),
             rot=(0.0, 0.0, 0.0, 1.0),
         ),
     )
@@ -495,19 +627,11 @@ class SO101SceneCfg(InteractiveSceneCfg):
         history_length=4,
     )
     fixed_jaw_support = preset(
-        default=ContactSensorCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/gripper",
-            filter_prim_paths_expr=["{ENV_REGEX_NS}/Desk"],
-            history_length=1,
-        ),
+        default=None,
         sim2real=_jaw_support_sensor("gripper"),
     )
     moving_jaw_support = preset(
-        default=ContactSensorCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/moving_jaw_so101_v1",
-            filter_prim_paths_expr=["{ENV_REGEX_NS}/Desk"],
-            history_length=1,
-        ),
+        default=None,
         sim2real=_jaw_support_sensor("moving_jaw_so101_v1"),
     )
 
@@ -571,7 +695,12 @@ class PolicyStateGroupCfg(ObsGroup):
         func=mdp.body_state_b,
         params={"body_asset_cfg": SceneEntityCfg("ball"), "base_asset_cfg": SceneEntityCfg("robot")},
     )
-    # 進捗フラグ（把持・リフトのマルコフ性維持用）
+    # 箱（カゴ）の位置観測を追加
+    box = ObsTerm(
+        func=mdp.body_state_b,
+        params={"body_asset_cfg": SceneEntityCfg("box"), "base_asset_cfg": SceneEntityCfg("robot")},
+    )
+    # 進捗フラグ（把持・リフト・箱投入のマルコフ性維持用）
     progress = ObsTerm(func=mdp.progress_flags)
 
     def __post_init__(self):
@@ -616,11 +745,16 @@ class EventsCfg:
             "operation": "abs",
         },
     )
-    # 机の上にボールをランダム配置してロボットを初期姿勢にするリセット（grasp_probの割合で把持状態からも開始）
+    # 机の上にボールをランダム配置してロボットを初期姿勢にするリセット
+    # ※下の "grasp_prob": 0.3 をコメントアウト（または 0.0）にすれば、把持スタートをOFF（100%机スタート）にできます
     reset_ball = EventTerm(
         func=mdp.reset_ball_step1,
         mode="reset",
-        params={"ball_pos_center": (0.23, 0.0), "ball_pos_noise": (0.03, 0.04), "grasp_prob": 0.3},
+        params={
+            "ball_pos_center": (0.36, 0.0),
+            "ball_pos_noise": (0.03, 0.04),
+            "grasp_prob": 0.3,  # ← ここをコメントアウトすれば把持スタートOFF
+        },
     )
 
 
@@ -693,18 +827,21 @@ class Sim2RealEventsCfg(EventsCfg):
 
 @configclass
 class RewardsCfg:
-    """STEP 1 報酬設計: アプローチ＆持ち上げシェーピング報酬、マイルストーン、押し付けペナルティ"""
+    """ボール把持＆箱投入（Pick & Place）報酬設計"""
 
     # ボール中心への接近報酬（球体中心を狙うためオフセットは0）
     approach_progress = RewTerm(
         func=mdp.approach_progress, weight=1.0, params={"height_offset": 0.0}
     )
-    # 持ち上げシェーピング報酬: ボールを浮かせている間、目標高さに近づくほど連続的に加点（1ステップ最大 0.3）
-    # gamma=0.995 では「目標直前で保持し続ける」価値は最大でも約60程度となり、成功(200+20)を明確に下回る。
+    # 持ち上げシェーピング報酬: ボールを浮かせている間、箱の壁を越える目標高さに近づくほど加点
     lift_progress = RewTerm(func=mdp.lift_progress, weight=0.3, params={"pinch_bonus": 0.1})
-    # マイルストーン報酬: 把持達成(+10.0) および 目標高さ到達(+20.0) の1回限りボーナス
-    milestones = RewTerm(func=mdp.milestones, weight=1.0, params={"grasp_bonus": 10.0, "lift_bonus": 20.0})
-    # 完了ボーナス: 目標高さ以上で安定キープできた時の成功報酬
+    # 箱誘導報酬: 持ち上げた後、箱の上空目標点へ近づけて放すほど加点
+    place_goal = RewTerm(func=mdp.place_goal, weight=0.4, params={"std": 0.12})
+    # マイルストーン報酬: 把持(+10.0), 安全高さリフト(+20.0), 箱投入＆リリース(+40.0) の1回限りボーナス
+    milestones = RewTerm(
+        func=mdp.milestones, weight=1.0, params={"grasp_bonus": 10.0, "lift_bonus": 20.0, "place_bonus": 40.0}
+    )
+    # 完了ボーナス: 箱の中で安定静止できた時の成功報酬
     success = RewTerm(func=mdp.success, weight=200.0)
     ball_lost = RewTerm(
         func=mdp.is_terminated_term, weight=-50.0, params={"term_keys": ["ball_out_of_bounds", "ball_dropped"]}
@@ -712,13 +849,16 @@ class RewardsCfg:
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.002)
     joint_velocity = RewTerm(func=mdp.joint_vel_l2, weight=-0.0002)
     joint_limits = RewTerm(func=mdp.joint_pos_limits, weight=-1.0)
-    # 机押し付けペナルティ: 爪が机を強く押すと減点（上から押し付けて両爪接触をごまかすのを防止）
-    jaw_support_force = RewTerm(func=mdp.jaw_support_force, weight=-8.0, params={"free_force": 0.25, "force_span": 2.0})
+    # 机押し付けペナルティ: defaultではSupportがないためNone、sim2realプリセット時のみ有効
+    jaw_support_force = preset(
+        default=None,
+        sim2real=RewTerm(func=mdp.jaw_support_force, weight=-8.0, params={"free_force": 0.25, "force_span": 2.0}),
+    )
 
 
 @configclass
 class TerminationsCfg:
-    success = DoneTerm(func=mdp.ball_lift_success)
+    success = DoneTerm(func=mdp.ball_place_success)
     ball_dropped = DoneTerm(func=mdp.ball_dropped)
     # ロボットのベース座標系はZ軸周りに+90度回転しているため、机の範囲外を判定
     ball_out_of_bounds = DoneTerm(

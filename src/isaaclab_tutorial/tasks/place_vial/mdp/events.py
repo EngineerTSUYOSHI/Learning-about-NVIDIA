@@ -110,29 +110,34 @@ class reset_ball_step1(ManagerTermBase):
     以降の保持はポリシー自身がグリッパーを閉じ続けることで行う。
     """
 
-    # キャリブレーションで掃引するグリッパー角度範囲 [rad]（ボール直径40mm前後を十分含む範囲）
-    _CALIBRATION_RANGE = (math.radians(-12.0), math.radians(60.0))
+    # キャリブレーションで掃引するグリッパー角度範囲 [rad]（直径50mm前後のボールも十分含む範囲）
+    _CALIBRATION_RANGE = (math.radians(-12.0), math.radians(75.0))
     _CALIBRATION_SAMPLES = 64
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         from isaaclab_tutorial.tasks.place_vial.config.so101.env_cfg import (
+            _ENV_BALL_RADII,
             WORKSHOP_GRASP_JOINT_POSITION,
             WORKSHOP_INITIAL_JOINT_POSITION,
             WORKSHOP_LIFT_MID_JOINT_POSITION,
         )
+        from .task import BALL_RADIUS
 
         self.default_joint_pos = torch.tensor(WORKSHOP_INITIAL_JOINT_POSITION, device=env.device)
         self.grasp_joint_pos = torch.tensor(WORKSHOP_GRASP_JOINT_POSITION, device=env.device)
         self.lift_mid_joint_pos = torch.tensor(WORKSHOP_LIFT_MID_JOINT_POSITION, device=env.device)
-        self.grip_angle: float | None = None
+        self.grip_table: tuple[torch.Tensor, torch.Tensor] | None = None
 
-    def _calibrate_grip_angle(self, env: ManagerBasedRLEnv, ids: torch.Tensor, clearance: float) -> float:
-        """両爪先端の間隔が ``2 * BALL_RADIUS + clearance`` になるグリッパー角度 [rad] をFKで求める。
+        # 環境ごとのボール半径を env._so101_ball_radius に登録（サイズ自動判定の基準になる）
+        if len(_ENV_BALL_RADII) == env.num_envs:
+            env._so101_ball_radius = torch.tensor(_ENV_BALL_RADII, dtype=torch.float32, device=env.device)
+        else:
+            env._so101_ball_radius = torch.full((env.num_envs,), BALL_RADIUS, dtype=torch.float32, device=env.device)
 
-        爪先端の間隔はグリッパー関節角だけで決まる（腕の姿勢に依存しない）ので、一度求めれば使い回せる。
-        """
-        from .task import BALL_RADIUS, fingertip_positions_w
+    def _calibrate_grip_table(self, env: ManagerBasedRLEnv, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """グリッパー角度と両爪先端間隔の対応テーブル（ソート済み）をFKで測定する。"""
+        from .task import fingertip_positions_w
 
         robot = env.scene["robot"]
         angles = torch.linspace(*self._CALIBRATION_RANGE, self._CALIBRATION_SAMPLES, device=env.device)
@@ -148,37 +153,43 @@ class reset_ball_step1(ManagerTermBase):
             fixed, moving = fingertip_positions_w(env)
             gaps[start : start + k] = torch.linalg.vector_norm(fixed[ids[:k]] - moving[ids[:k]], dim=-1)
 
-        target_gap = 2.0 * BALL_RADIUS + clearance
         order = torch.argsort(gaps)
-        sorted_gaps, sorted_angles = gaps[order].cpu(), angles[order].cpu()
-        if not (sorted_gaps[0] <= target_gap <= sorted_gaps[-1]):
-            raise RuntimeError(
-                f"グリッパー角度 {self._CALIBRATION_RANGE} の範囲で爪先端間隔 {target_gap:.4f} m を実現できません"
-                f"（測定範囲 {float(sorted_gaps[0]):.4f}〜{float(sorted_gaps[-1]):.4f} m）。"
-                "BALL_RADIUS または _CALIBRATION_RANGE を確認してください。"
-            )
-        index = int(torch.searchsorted(sorted_gaps, torch.tensor(target_gap)).clamp(1, len(sorted_gaps) - 1))
-        g0, g1 = float(sorted_gaps[index - 1]), float(sorted_gaps[index])
-        a0, a1 = float(sorted_angles[index - 1]), float(sorted_angles[index])
-        angle = a0 if g1 == g0 else a0 + (target_gap - g0) * (a1 - a0) / (g1 - g0)
-        print(f"[reset_ball_step1] 把持スタート用グリッパー角度: {math.degrees(angle):.2f} deg (爪先端間隔 {target_gap:.4f} m)")
-        return angle
+        sorted_gaps, sorted_angles = gaps[order], angles[order]
+        print(
+            f"[reset_ball_step1] 爪間隔キャリブレーション完了: "
+            f"間隔 {float(sorted_gaps[0])*1000:.1f}〜{float(sorted_gaps[-1])*1000:.1f} mm "
+            f"(角度 {math.degrees(float(sorted_angles[0])):.1f}〜{math.degrees(float(sorted_angles[-1])):.1f} deg)"
+        )
+        return sorted_gaps, sorted_angles
+
+    def _grip_angles_for_radii(
+        self, radii: torch.Tensor, clearance: float
+    ) -> torch.Tensor:
+        """各環境のボール半径 ``radii`` に対して、爪先端間隔 ``2*r + clearance`` になるグリッパー角度を線形補間で求める。"""
+        assert self.grip_table is not None
+        sorted_gaps, sorted_angles = self.grip_table
+        target_gaps = (2.0 * radii + clearance).clamp(sorted_gaps[0], sorted_gaps[-1])
+        idx = torch.searchsorted(sorted_gaps, target_gaps).clamp(1, len(sorted_gaps) - 1)
+        g0, g1 = sorted_gaps[idx - 1], sorted_gaps[idx]
+        a0, a1 = sorted_angles[idx - 1], sorted_angles[idx]
+        denom = (g1 - g0).clamp_min(1.0e-8)
+        return a0 + (target_gaps - g0) * (a1 - a0) / denom
 
     def __call__(
         self,
         env: ManagerBasedRLEnv,
         env_ids: torch.Tensor | None,
-        ball_pos_center: tuple[float, float] = (0.23, 0.0),
+        ball_pos_center: tuple[float, float] = (0.36, 0.0),
         ball_pos_noise: tuple[float, float] = (0.03, 0.04),
-        grasp_prob: float = 0.3,
+        grasp_prob: float = 0.0,
         grip_clearance: float = 0.001,
         grip_squeeze: float = 0.15,
     ) -> None:
         from .task import (
-            BALL_LIFT_MIN_HEIGHT,
             BALL_LIFT_TARGET_HEIGHT,
-            BALL_RADIUS,
-            BALL_REST_HEIGHT,
+            ball_lift_min_height,
+            ball_radius,
+            ball_rest_height,
             fingertip_positions_w,
             grasp_center_w,
         )
@@ -189,6 +200,9 @@ class reset_ball_step1(ManagerTermBase):
         origins = env.scene.env_origins[ids]
         support_h = getattr(env, "_so101_support_height", 0.0)
         h = support_h[ids] if isinstance(support_h, torch.Tensor) else support_h
+        radii = ball_radius(env)[ids]
+        rest_h = ball_rest_height(env)[ids]
+        min_lift_h = ball_lift_min_height(env)[ids]
 
         # 各環境を「把持スタート」にするか「通常ホームスタート」にするかを確率 grasp_prob で決定
         is_grasped = torch.rand(n, device=env.device) < grasp_prob
@@ -198,8 +212,8 @@ class reset_ball_step1(ManagerTermBase):
         grasp_pose = default_pose.clone()
         jaw_center_w = None
         if is_grasped.any():
-            if self.grip_angle is None:
-                self.grip_angle = self._calibrate_grip_angle(env, ids, grip_clearance)
+            if self.grip_table is None:
+                self.grip_table = self._calibrate_grip_table(env, ids)
 
             # 机直上の把持ポーズ〜持ち上げ序盤ポーズの間をランダム補間し、少し関節ノイズを加える
             blend = torch.empty((n, 1), device=env.device).uniform_(0.0, 0.35)
@@ -209,8 +223,8 @@ class reset_ball_step1(ManagerTermBase):
             noise[:, 1].uniform_(-0.03, 0.03)  # shoulder_lift
             noise[:, 2].uniform_(-0.03, 0.03)  # elbow_flex
             grasp_pose = grasp_pose + noise
-            # 爪先端の間隔がボール直径＋クリアランスになる角度（めり込み・隙間なし）
-            grasp_pose[:, 5] = self.grip_angle
+            # 各環境のボール直径＋クリアランスになる角度をテーブルから算出
+            grasp_pose[:, 5] = self._grip_angles_for_radii(radii, grip_clearance)
 
             # FKで爪の位置を確認し、机にめり込む姿勢・最初から目標高さ付近にある姿勢は通常スタートに切り替える
             robot.write_joint_position_to_sim_index(
@@ -221,9 +235,9 @@ class reset_ball_step1(ManagerTermBase):
             fixed_w, moving_w = fingertip_positions_w(env)
             lowest_tip = torch.minimum(fixed_w[ids, 2], moving_w[ids, 2]) - origins[:, 2]
             center_z = jaw_center_w[:, 2] - origins[:, 2]
-            desk_top = BALL_REST_HEIGHT - BALL_RADIUS + h
+            desk_top = 0.035 + h
             valid = (
-                (center_z >= BALL_LIFT_MIN_HEIGHT + 0.002 + h)
+                (center_z >= min_lift_h + 0.002)
                 & (center_z <= BALL_LIFT_TARGET_HEIGHT - 0.01)
                 & (lowest_tip >= desk_top + 0.002)
             )
@@ -248,7 +262,7 @@ class reset_ball_step1(ManagerTermBase):
         u_y = torch.empty(n, device=env.device).uniform_(-ball_pos_noise[1], ball_pos_noise[1])
         ball_pos[:, 0] = ball_pos_center[0] + u_x
         ball_pos[:, 1] = ball_pos_center[1] + u_y
-        ball_pos[:, 2] = BALL_REST_HEIGHT + h
+        ball_pos[:, 2] = rest_h
         ball_pos[:, 6] = 1.0  # 単位クォータニオン (XYZW: 0, 0, 0, 1)
         if jaw_center_w is not None:
             ball_pos[is_grasped, :3] = jaw_center_w[is_grasped] - origins[is_grasped]

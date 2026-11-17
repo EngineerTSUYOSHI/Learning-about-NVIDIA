@@ -10,7 +10,7 @@ import torch
 from isaaclab.managers import ManagerTermBase, ObservationTermCfg, SceneEntityCfg
 from isaaclab.utils.images import CameraFrameStack
 
-from .progress import ball_lift_progress
+from .progress import ball_place_progress
 from .task import jaw_contacts
 
 if TYPE_CHECKING:
@@ -35,9 +35,9 @@ def encoder_joint_target(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> t
 
 
 def progress_flags(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """把持・リフトのマイルストーン達成フラグ（マルコフ性を保つための観測）。"""
-    progress = ball_lift_progress(env)
-    return torch.stack((progress.grasped, progress.lifted), dim=-1).float()
+    """把持・リフト・箱投入のマイルストーン達成フラグ（マルコフ性を保つための観測）。"""
+    progress = ball_place_progress(env)
+    return torch.stack((progress.grasped, progress.lifted, progress.placed), dim=-1).float()
 
 
 def jaw_contact_flags(env: ManagerBasedRLEnv) -> torch.Tensor:

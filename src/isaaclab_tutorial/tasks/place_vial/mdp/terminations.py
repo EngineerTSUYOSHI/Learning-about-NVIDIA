@@ -1,4 +1,4 @@
-"""STEP 1（ボール把持＆持ち上げ）の終了判定モジュール。"""
+"""ボール把持＆箱投入（Pick & Place）の終了判定モジュール。"""
 
 from __future__ import annotations
 
@@ -9,19 +9,28 @@ import torch
 
 from isaaclab.managers import ManagerTermBase, TerminationTermCfg
 
-from .progress import ball_lift_progress
-from .task import BALL_LIFT_MIN_HEIGHT, BALL_LIFT_TARGET_HEIGHT, ball_height, ball_is_holding, contact_force
+from .progress import ball_place_progress
+from .task import (
+    BALL_LIFT_TARGET_HEIGHT,
+    ball_height,
+    ball_in_box,
+    ball_is_holding,
+    ball_lift_min_height,
+    contact_force,
+    gripper_openness,
+    jaw_contacts,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-class ball_lift_success(ManagerTermBase):
-    """毎ステップ進捗を更新し、ボールを目標高さ以上で一定ステップ安定保持できたらエピソード成功として終了する。"""
+class ball_place_success(ManagerTermBase):
+    """毎ステップ進捗を更新し、ボールが箱の中で放されて一定ステップ静止したらタスク成功として終了する。"""
 
     def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        self.progress = ball_lift_progress(env)
+        self.progress = ball_place_progress(env)
         self.max_support_force = torch.zeros(self.num_envs, device=self.device)
         self.support_contact_time = torch.zeros_like(self.max_support_force)
 
@@ -38,12 +47,27 @@ class ball_lift_success(ManagerTermBase):
 
     def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
         holding = ball_is_holding(env)  # 両爪でボールを挟み、机から浮かせているか
-        lifted_to_target = holding & (ball_height(env) >= BALL_LIFT_TARGET_HEIGHT)  # 把持したまま目標高さに到達したか
-        success = self.progress.update(holding, lifted_to_target, env.episode_length_buf)
+        lifted_to_target = holding & (ball_height(env) >= BALL_LIFT_TARGET_HEIGHT)  # 箱の壁を越える高さに達したか
+
+        # 箱に入っており、両爪がボールを放してグリッパーが開いているか
+        fixed, moving = jaw_contacts(env)
+        released = ~(fixed | moving) & (gripper_openness(env) > 0.25)
+        in_box = ball_in_box(env)
+        placed = in_box & released
+
+        # 箱の中で速度・角速度が十分に落ちて静止しているか
+        ball = env.scene["ball"]
+        still = (torch.linalg.vector_norm(ball.data.root_lin_vel_w.torch, dim=-1) < 0.08) & (
+            torch.linalg.vector_norm(ball.data.root_ang_vel_w.torch, dim=-1) < 1.0
+        )
+        settled = placed & still
+
+        success = self.progress.update(holding, lifted_to_target, placed, settled, env.episode_length_buf)
 
         log = env.extras.setdefault("log", {})
         log["Metrics/grasp_rate"] = self.progress.grasped.float().mean()
         log["Metrics/lift_rate"] = self.progress.lifted.float().mean()
+        log["Metrics/place_rate"] = self.progress.placed.float().mean()
         log["Metrics/success_rate"] = success.float().mean()
         if "fixed_jaw_support" in env.scene.sensors:
             support_force = torch.maximum(
@@ -60,11 +84,6 @@ class ball_lift_success(ManagerTermBase):
 
 
 def ball_dropped(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """一度目標高さまで持ち上げたボールが机（マット）の上まで落ちた場合に終了判定を返す。
-
-    以前はロボット根元（z≈0）との比較だったため、机上（ボール中心 z≈0.055）への落下では発火しなかった。
-    机上で静止しているとみなす高さ（``BALL_LIFT_MIN_HEIGHT`` 未満）まで戻ったら落下とする。
-    """
-    support_height = getattr(env, "_so101_support_height", 0.0)
-    fallen = ball_height(env) < BALL_LIFT_MIN_HEIGHT + support_height
-    return ball_lift_progress(env).lifted & fallen
+    """一度持ち上げたボールが箱の外の机（マット）の上まで落ちた場合に終了判定を返す。"""
+    fallen = ball_height(env) < ball_lift_min_height(env)
+    return ball_place_progress(env).lifted & fallen & ~ball_in_box(env)

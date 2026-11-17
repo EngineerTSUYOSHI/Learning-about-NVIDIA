@@ -3,9 +3,12 @@ __all__ = [
     "BALL_LIFT_TARGET_HEIGHT",
     "BALL_RADIUS",
     "BALL_REST_HEIGHT",
+    "BOX_HEIGHT",
+    "BOX_SIZE",
+    "BOX_WALL_THICKNESS",
     "approach_progress",
     "ball_dropped",
-    "ball_lift_success",
+    "ball_place_success",
     "encoder_joint_pos",
     "encoder_joint_target",
     "jaw_contact_flags",
@@ -13,6 +16,7 @@ __all__ = [
     "joint_target",
     "lift_progress",
     "milestones",
+    "place_goal",
     "progress_flags",
     "randomize_encoder_bias",
     "randomize_joint_viscous_friction",
@@ -43,6 +47,14 @@ from .observations import (
     progress_flags,
     wrist_rgb,
 )
-from .rewards import approach_progress, jaw_support_force, lift_progress, milestones, success
-from .task import BALL_LIFT_MIN_HEIGHT, BALL_LIFT_TARGET_HEIGHT, BALL_RADIUS, BALL_REST_HEIGHT
-from .terminations import ball_dropped, ball_lift_success
+from .rewards import approach_progress, jaw_support_force, lift_progress, milestones, place_goal, success
+from .task import (
+    BALL_LIFT_MIN_HEIGHT,
+    BALL_LIFT_TARGET_HEIGHT,
+    BALL_RADIUS,
+    BALL_REST_HEIGHT,
+    BOX_HEIGHT,
+    BOX_SIZE,
+    BOX_WALL_THICKNESS,
+)
+from .terminations import ball_dropped, ball_place_success
