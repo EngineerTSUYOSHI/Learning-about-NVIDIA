@@ -169,8 +169,8 @@ def _spawn_open_box(
     if translation is not None:
         root_xform.AddTranslateOp().Set(Gf.Vec3d(*translation))
     if orientation is not None:
-        # orientationはWXYZまたはXYZWに注意: sim_utilsのSpawnersと同じく(w, x, y, z)で受け取る
-        root_xform.AddOrientOp().Set(Gf.Quatf(orientation[0], orientation[1], orientation[2], orientation[3]))
+        # Isaac Lab の回転表現は XYZW 順、Gf.Quatf の引数は (w, x, y, z) 順
+        root_xform.AddOrientOp().Set(Gf.Quatf(orientation[3], orientation[0], orientation[1], orientation[2]))
 
     # 静的・キネマティック剛体として定義（ボールが当たっても箱自体は動かない）
     rb_api = UsdPhysics.RigidBodyAPI.Apply(root_prim)

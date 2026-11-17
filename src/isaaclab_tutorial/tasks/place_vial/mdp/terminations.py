@@ -12,11 +12,14 @@ from isaaclab.managers import ManagerTermBase, TerminationTermCfg
 from .progress import ball_place_progress
 from .task import (
     BALL_LIFT_TARGET_HEIGHT,
+    ball_grasp_point_w,
     ball_height,
     ball_in_box,
     ball_is_holding,
     ball_lift_min_height,
+    ball_radius,
     contact_force,
+    grasp_center_w,
     gripper_openness,
     jaw_contacts,
 )
@@ -49,9 +52,14 @@ class ball_place_success(ManagerTermBase):
         holding = ball_is_holding(env)  # 両爪でボールを挟み、机から浮かせているか
         lifted_to_target = holding & (ball_height(env) >= BALL_LIFT_TARGET_HEIGHT)  # 箱の壁を越える高さに達したか
 
-        # 箱に入っており、両爪がボールを放してグリッパーが開いているか
+        # 箱に入っており、爪がボールから離れてグリッパーが開いているか
+        # （fixed_jaw_contact は無フィルタのため、爪がボールから離れていれば箱壁等に当たっていても放したとみなす）
         fixed, moving = jaw_contacts(env)
-        released = ~(fixed | moving) & (gripper_openness(env) > 0.25)
+        near_ball = torch.linalg.vector_norm(grasp_center_w(env) - ball_grasp_point_w(env), dim=-1) < (
+            ball_radius(env) + 0.015
+        )
+        touching_ball = (fixed | moving) & near_ball
+        released = ~touching_ball & (gripper_openness(env) > 0.25)
         in_box = ball_in_box(env)
         placed = in_box & released
 

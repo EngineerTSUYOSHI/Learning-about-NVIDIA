@@ -124,10 +124,10 @@ def ball_in_jaws(env: ManagerBasedRLEnv, margin: float = 0.006) -> torch.Tensor:
 
 
 def ball_is_holding(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """両爪がボールに接触し、かつ各環境のサイズに応じた浮上クリアランスを超えている場合に True を返す。"""
-    fixed, moving = jaw_contacts(env)
+    """両爪の中心付近でボールを挟み、かつ各環境のサイズに応じた浮上クリアランスを超えている場合に True を返す。"""
+    # fixed_jaw_contact が無フィルタの場合でも机・箱接触だけで誤判定しないよう ball_in_jaws（距離条件付き）を使う
     lifted_off_desk = ball_height(env) > ball_lift_min_height(env)
-    return fixed & moving & lifted_off_desk
+    return ball_in_jaws(env) & lifted_off_desk
 
 
 def ball_lift_height_progress(env: ManagerBasedRLEnv) -> torch.Tensor:
