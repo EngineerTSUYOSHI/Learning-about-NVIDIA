@@ -10,8 +10,8 @@ import torch
 from isaaclab.managers import ManagerTermBase, ObservationTermCfg, SceneEntityCfg
 from isaaclab.utils.images import CameraFrameStack
 
-from .progress import placement_progress
-from .task import jaw_contacts, nearest_hole_distance, vial_in_rack, vial_upright
+from .progress import ball_place_progress
+from .task import jaw_contacts
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -34,26 +34,14 @@ def encoder_joint_target(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> t
     return joint_target(env, asset_cfg) + getattr(env, "_so101_encoder_bias", 0.0)
 
 
-def vial_in_rack_frame(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Vial root position in the rack frame [m]."""
-    return vial_in_rack(env)[0]
-
-
-def placement_features(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Distance to the nearest hole, lowest vial point above the rack, uprightness, and vial speed."""
-    position, _, lowest = vial_in_rack(env)
-    speed = torch.linalg.vector_norm(env.scene["vial"].data.root_lin_vel_w.torch, dim=-1)
-    return torch.stack((nearest_hole_distance(position), lowest, vial_upright(env), speed), dim=-1)
-
-
 def progress_flags(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Latched grasp, lift and insertion milestones, which make the once-per-episode rewards Markov."""
-    progress = placement_progress(env)
-    return torch.stack((progress.grasped, progress.lifted, progress.inserted), dim=-1).float()
+    """把持・リフト・箱投入のマイルストーン達成フラグ（マルコフ性を保つための観測）。"""
+    progress = ball_place_progress(env)
+    return torch.stack((progress.grasped, progress.lifted, progress.placed), dim=-1).float()
 
 
 def jaw_contact_flags(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Privileged fixed-jaw, moving-jaw and bilateral vial contact."""
+    """固定爪・可動爪・両爪同時接触の特権観測フラグ（Critic用）。"""
     fixed, moving = jaw_contacts(env)
     return torch.stack((fixed, moving, fixed & moving), dim=-1).float()
 

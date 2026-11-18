@@ -1,4 +1,4 @@
-"""Reward terms: dense approach and transport shaping, one-time milestones, and success."""
+"""ボール把持＆箱投入（Pick & Place）の報酬関数定義。"""
 
 from __future__ import annotations
 
@@ -9,23 +9,26 @@ import torch
 
 from isaaclab.managers import ManagerTermBase, RewardTermCfg
 
-from .geometry import hole_relative_positions, symmetric_axial_keypoint_error
-from .progress import placement_progress
-from .task import VIAL_AXIS_MAX, VIAL_AXIS_MIN, contact_force, grasp_center_w, vial_grasp_point_w, vial_in_rack
+from .progress import ball_place_progress
+from .task import (
+    BALL_LIFT_TARGET_HEIGHT,
+    ball_grasp_point_w,
+    ball_in_box,
+    ball_in_jaws,
+    ball_is_holding,
+    ball_lift_height_progress,
+    ball_rest_height,
+    contact_force,
+    grasp_center_w,
+    gripper_openness,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-HELD_INSERTION_TARGET = (0.0, 0.0, 0.060)
-"""Rack-local hole-relative root position at the end of a held insertion; gravity finishes the travel."""
-
 
 class approach_progress(ManagerTermBase):
-    """Pay the decrease in pad-centre-to-cap distance, in units of ``scale``, until the vial is grasped.
-
-    A difference of potentials has no incentive to hover, and gives the same gradient 25 cm from the vial as 2 cm
-    away, which is what lets a pixels-only policy discover the approach from the home pose.
-    """
+    """両爪中心とボール中心との距離が縮まるたびに支払われるポテンシャル差分報酬。"""
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
@@ -35,43 +38,71 @@ class approach_progress(ManagerTermBase):
         self.previous_distance[slice(None) if env_ids is None else env_ids] = float("nan")
 
     def __call__(self, env: ManagerBasedRLEnv, scale: float = 0.01, height_offset: float = 0.0) -> torch.Tensor:
-        # Raising the target above the cap favours a shallower pinch; grasp milestones still need physical proof.
-        target = vial_grasp_point_w(env)
-        target = target + target.new_tensor((0.0, 0.0, height_offset))
+        target = ball_grasp_point_w(env)
+        if height_offset != 0.0:
+            target = target + target.new_tensor((0.0, 0.0, height_offset))
         distance = torch.linalg.vector_norm(grasp_center_w(env) - target, dim=-1)
         progress = ((self.previous_distance - distance) / scale).clamp(-1.0, 1.0)
         self.previous_distance = distance
-        # The first step after a reset has no previous distance (NaN) and pays nothing.
-        return torch.where(placement_progress(env).grasped, 0.0, progress.nan_to_num(0.0))
+        # すでにボールを保持中または箱に入った後は接近報酬を0にする
+        progress_state = ball_place_progress(env)
+        inactive = ball_is_holding(env) | progress_state.placed
+        return torch.where(inactive, 0.0, progress.nan_to_num(0.0))
 
 
-def held_goal(env: ManagerBasedRLEnv, std: float = 0.10) -> torch.Tensor:
-    """Bring the held vial to the insertion pose above the closest hole, until it is inserted.
+def lift_progress(
+    env: ManagerBasedRLEnv,
+    target_height: float = BALL_LIFT_TARGET_HEIGHT,
+    pinch_bonus: float = 0.1,
+) -> torch.Tensor:
+    """爪の間でボールを挟んだ状態（``pinch_bonus``）から、箱の壁を越える目標高さまで持ち上げる密な報酬。
 
-    There is deliberately no equivalent bump around the vial before the grasp: a policy whose grasp is still
-    unreliable learns to hover in it instead of attempting the grasp.
+    すでに目標高さへ到達（``lifted``）した後は、箱への運搬（``place_goal``）に集中できるよう加点を止める。
     """
-    position, axis, _ = vial_in_rack(env)
-    error = symmetric_axial_keypoint_error(
-        hole_relative_positions(position),
-        axis.unsqueeze(1),
-        position.new_tensor(HELD_INSERTION_TARGET),
-        position.new_tensor((0.0, 0.0, 1.0)),
-        VIAL_AXIS_MIN,
-        VIAL_AXIS_MAX,
-    ).amin(dim=-1)
-    progress = placement_progress(env)
-    return torch.where(progress.grasped & ~progress.inserted, torch.exp(-error / std), 0.0)
+    progress_state = ball_place_progress(env)
+    in_jaws = ball_in_jaws(env)
+    holding = ball_is_holding(env)
+    target = target_height if target_height > 0.0 else BALL_LIFT_TARGET_HEIGHT
+    max_travel = (target - ball_rest_height(env)).clamp_min(0.01)
+    height_ratio = (ball_lift_height_progress(env) / max_travel).clamp(0.0, 1.0)
+    lift_score = pinch_bonus + (1.0 - pinch_bonus) * height_ratio
+    raw = torch.where(holding, lift_score, torch.where(in_jaws, pinch_bonus, 0.0))
+    return torch.where(progress_state.lifted | progress_state.placed, 0.0, raw)
+
+
+def place_goal(env: ManagerBasedRLEnv, std: float = 0.12) -> torch.Tensor:
+    """安全高さまで持ち上げた後、壁を越えて箱の上空→箱の内側へ誘導し、リリースを促す報酬。
+
+    1. ``progress_state.lifted``（目標高さ到達）までは発動させず、まず壁を越える高さまで上げさせる。
+    2. 箱のXY範囲に入るまでは壁上空の高さ（``BALL_LIFT_TARGET_HEIGHT``）を維持させ、壁の角への衝突を防ぐ。
+    3. 箱のXY範囲に入ったら箱の底付近へ降ろし、指を開く（``gripper_openness``）ことで投入完了を促す。
+    """
+    progress_state = ball_place_progress(env)
+    # 壁を越える高さ（lifted）に達してから箱への誘導を開始し、箱の壁に引っかかるのを防ぐ
+    active = progress_state.lifted & ~progress_state.placed
+
+    ball_pos = ball_grasp_point_w(env)
+    box_pos = env.scene["box"].data.root_pos_w.torch
+    in_box_xy = ((ball_pos[:, 0] - box_pos[:, 0]).abs() < 0.045) & ((ball_pos[:, 1] - box_pos[:, 1]).abs() < 0.045)
+
+    target = box_pos.clone()
+    above_wall_z = env.scene.env_origins[:, 2] + BALL_LIFT_TARGET_HEIGHT
+    inside_box_z = box_pos[:, 2] + 0.040
+    target[:, 2] = torch.where(in_box_xy, inside_box_z, above_wall_z)
+
+    dist = torch.linalg.vector_norm(ball_pos - target, dim=-1)
+    approach_box = torch.exp(-dist / std)
+    # ボールが箱の内側に入っている時にグリッパーを開くと追加で加点し、リリースを促す
+    in_box_release = torch.where(ball_in_box(env), 0.5 * gripper_openness(env), 0.0)
+    return torch.where(active, approach_box + in_box_release, 0.0)
 
 
 class milestones(ManagerTermBase):
-    """Pay grasp, lift and insertion once per episode, in the ratio 1:2:4.
-
-    Milestones present on the first step after a reset (restored from the reset dataset) are not paid.
-    """
+    """エピソード中に一度だけ支払われるマイルストーン報酬（把持: 10.0, リフト: 20.0, 箱投入: 40.0）。"""
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
+        # 0=grasped(把持), 1=lifted(安全高さ到達), 2=placed(箱投入＆リリース)
         self.paid = torch.zeros((self.num_envs, 3), dtype=torch.bool, device=self.device)
         self.started = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
@@ -80,10 +111,17 @@ class milestones(ManagerTermBase):
         self.paid[ids] = False
         self.started[ids] = False
 
-    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
-        progress = placement_progress(env)
-        reached = torch.stack((progress.grasped, progress.lifted, progress.inserted), dim=-1)
-        reward = ((reached & ~self.paid).float() * reached.new_tensor((1.0, 2.0, 4.0), dtype=torch.float32)).sum(-1)
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        grasp_bonus: float = 10.0,
+        lift_bonus: float = 20.0,
+        place_bonus: float = 40.0,
+    ) -> torch.Tensor:
+        progress = ball_place_progress(env)
+        reached = torch.stack((progress.grasped, progress.lifted, progress.placed), dim=-1)
+        bonus = torch.tensor((grasp_bonus, lift_bonus, place_bonus), dtype=torch.float32, device=self.device)
+        reward = ((reached & ~self.paid).float() * bonus).sum(-1)
         reward = torch.where(self.started, reward, 0.0)
         self.paid = reached.clone()
         self.started[:] = True
@@ -91,11 +129,11 @@ class milestones(ManagerTermBase):
 
 
 def success(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """One-step confirmed placement success."""
-    return placement_progress(env).success.float()
+    """ボールが箱の中で安定静止してタスク成功となった時の1ステップ報酬。"""
+    return ball_place_progress(env).success.float()
 
 
 def jaw_support_force(env: ManagerBasedRLEnv, free_force: float = 1.0, force_span: float = 5.0) -> torch.Tensor:
-    """Penalize either jaw pushing on the desk or mat beyond ``free_force`` [N], saturating after ``force_span``."""
+    """爪が机やマットを ``free_force`` [N] 以上で押し付けた際のペナルティ（上から押さえつけ防止）。"""
     force = torch.maximum(contact_force(env, "fixed_jaw_support"), contact_force(env, "moving_jaw_support"))
     return ((force - free_force) / force_span).clamp(0.0, 1.0)
