@@ -835,8 +835,8 @@ class RewardsCfg:
     )
     # 持ち上げシェーピング報酬: ボールを浮かせている間、箱の壁を越える目標高さに近づくほど加点
     lift_progress = RewTerm(func=mdp.lift_progress, weight=0.3, params={"pinch_bonus": 0.1})
-    # 箱誘導報酬: 持ち上げた後、箱の上空目標点へ近づけて放すほど加点
-    place_goal = RewTerm(func=mdp.place_goal, weight=0.4, params={"std": 0.12})
+    # 箱誘導報酬: 安全高さまで持ち上げた後、壁を越えて箱の中へ運ぶほど加点（ホバリング稼ぎを防ぐため重み0.15）
+    place_goal = RewTerm(func=mdp.place_goal, weight=0.15, params={"std": 0.12})
     # マイルストーン報酬: 把持(+10.0), 安全高さリフト(+20.0), 箱投入＆リリース(+40.0) の1回限りボーナス
     milestones = RewTerm(
         func=mdp.milestones, weight=1.0, params={"grasp_bonus": 10.0, "lift_bonus": 20.0, "place_bonus": 40.0}

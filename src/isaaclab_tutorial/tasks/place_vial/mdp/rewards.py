@@ -18,7 +18,6 @@ from .task import (
     ball_is_holding,
     ball_lift_height_progress,
     ball_rest_height,
-    box_target_pos_w,
     contact_force,
     grasp_center_w,
     gripper_openness,
@@ -72,18 +71,29 @@ def lift_progress(
 
 
 def place_goal(env: ManagerBasedRLEnv, std: float = 0.12) -> torch.Tensor:
-    """持ち上げたボールを箱の中心上空へ運ぶほど大きくなる密な誘導報酬。
+    """安全高さまで持ち上げた後、壁を越えて箱の上空→箱の内側へ誘導し、リリースを促す報酬。
 
-    ボールが箱の内側上空に到達して指を開いて放す段階も自然に促すため、箱の目標付近にいる状態も評価する。
+    1. ``progress_state.lifted``（目標高さ到達）までは発動させず、まず壁を越える高さまで上げさせる。
+    2. 箱のXY範囲に入るまでは壁上空の高さ（``BALL_LIFT_TARGET_HEIGHT``）を維持させ、壁の角への衝突を防ぐ。
+    3. 箱のXY範囲に入ったら箱の底付近へ降ろし、指を開く（``gripper_openness``）ことで投入完了を促す。
     """
     progress_state = ball_place_progress(env)
-    holding = ball_is_holding(env)
-    # 一度持ち上げた後、箱に投入完了するまで「ボールと箱の目標位置の距離」を縮めるよう誘導する
-    active = (progress_state.lifted | holding) & ~progress_state.placed
-    dist = torch.linalg.vector_norm(ball_grasp_point_w(env) - box_target_pos_w(env), dim=-1)
+    # 壁を越える高さ（lifted）に達してから箱への誘導を開始し、箱の壁に引っかかるのを防ぐ
+    active = progress_state.lifted & ~progress_state.placed
+
+    ball_pos = ball_grasp_point_w(env)
+    box_pos = env.scene["box"].data.root_pos_w.torch
+    in_box_xy = ((ball_pos[:, 0] - box_pos[:, 0]).abs() < 0.045) & ((ball_pos[:, 1] - box_pos[:, 1]).abs() < 0.045)
+
+    target = box_pos.clone()
+    above_wall_z = env.scene.env_origins[:, 2] + BALL_LIFT_TARGET_HEIGHT
+    inside_box_z = box_pos[:, 2] + 0.040
+    target[:, 2] = torch.where(in_box_xy, inside_box_z, above_wall_z)
+
+    dist = torch.linalg.vector_norm(ball_pos - target, dim=-1)
     approach_box = torch.exp(-dist / std)
-    # ボールが箱の内側に入っている時にグリッパーを開くと追加で小さく加点し、リリースを促す
-    in_box_release = torch.where(ball_in_box(env), 0.3 * gripper_openness(env), 0.0)
+    # ボールが箱の内側に入っている時にグリッパーを開くと追加で加点し、リリースを促す
+    in_box_release = torch.where(ball_in_box(env), 0.5 * gripper_openness(env), 0.0)
     return torch.where(active, approach_box + in_box_release, 0.0)
 
 
