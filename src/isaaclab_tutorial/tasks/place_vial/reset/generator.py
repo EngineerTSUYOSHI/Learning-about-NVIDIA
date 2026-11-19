@@ -14,30 +14,14 @@ from isaaclab_tutorial.tasks.place_vial.config.so101.env_cfg import (
     GRASP_GRIPPER_POSITION,
     PREGRASP_GRIPPER_POSITION,
     RELEASE_GRIPPER_POSITION,
-    TABLETOP_VIAL_HEADING_RANGE,
-    TABLETOP_VIAL_POSITION,
     WORKSHOP_INITIAL_JOINT_POSITION,
 )
 from isaaclab_tutorial.tasks.place_vial.mdp.geometry import hole_relative_positions, inside_bounds
 from isaaclab_tutorial.tasks.place_vial.mdp.observations import jaw_contact_flags as contact_state
 from isaaclab_tutorial.tasks.place_vial.mdp.task import (
-    HARD_RACK_IMPACT_FORCE,
-    RACK_CLEARANCE_HEIGHT,
-    RACK_RIM_HEIGHT,
-    SEATED_LOWER,
-    SEATED_UPPER,
-    VIAL_AXIS_MAX,
-    VIAL_AXIS_MIN,
-    VIAL_GRASP_OFFSET,
-    VIAL_RADIUS,
-    VIAL_REST_HEIGHT,
     fingertip_positions_w,
     grasp_center_w,
-    gripper_openness,
     jaw_contacts,
-    vial_grasp_point_w,
-    vial_in_rack,
-    vial_upright,
 )
 from isaaclab_tutorial.tasks.place_vial.mdp.task import contact_force as _contact_magnitude
 from isaaclab_tutorial.tasks.place_vial.reset.dataset import PHASE_NAMES, load_reset_dataset, save_reset_dataset

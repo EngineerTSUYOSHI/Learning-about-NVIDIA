@@ -26,3 +26,14 @@ gym.register(
         "default_agent": "rsl_rl",
     },
 )
+
+gym.register(
+    id="IsaacTutorial-Place-Ball-VLM-SO101",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{_PACKAGE}.vlm_env_cfg:SO101VialVLMEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{_PACKAGE}.agents.rsl_rl_ppo_cfg:SO101StatePPORunnerCfg",
+        "default_agent": "rsl_rl",
+    },
+)
