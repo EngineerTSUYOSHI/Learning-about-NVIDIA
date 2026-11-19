@@ -291,23 +291,27 @@ class reset_ball_step1(ManagerTermBase):
             box.write_root_pose_to_sim_index(root_pose=box_pose, env_ids=ids)
             box.write_root_velocity_to_sim_index(root_velocity=torch.zeros((n, 6), device=env.device), env_ids=ids)
 
-            # --- 将来用（Lv1検証: 箱の中の4スロットのうちランダムに3箇所へ既存ボールを配置）---
-            # env_cfg.py の box_ball_0〜2 を有効にした上で、以下をコメントアウト解除してください。
-            # from .task import BOX_WALL_THICKNESS
-            # slots = box_pose.new_tensor(
-            #     [[-0.027, -0.027], [0.027, -0.027], [-0.027, 0.027], [0.027, 0.027]]
-            # )
-            # # 各環境ごとに4つのスロットをシャッフルし、先頭3つを既存ボール、残り1つを空きスペースにする
-            # perms = torch.argsort(torch.rand(n, 4, device=env.device), dim=-1)
-            # zero_vel = torch.zeros((n, 6), device=env.device)
-            # for slot_idx, name in enumerate(("box_ball_0", "box_ball_1", "box_ball_2")):
-            #     if name in env.scene.keys():  # noqa: SIM118
-            #         chosen = slots[perms[:, slot_idx]]
-            #         b_pose = box_pose.clone()
-            #         b_pose[:, :2] += chosen
-            #         b_pose[:, 2] += BOX_WALL_THICKNESS + radii
-            #         env.scene[name].write_root_pose_to_sim_index(root_pose=b_pose, env_ids=ids)
-            #         env.scene[name].write_root_velocity_to_sim_index(root_velocity=zero_vel, env_ids=ids)
+            # Lv1検証用（VLMタスク等）: シーンに box_ball_0〜2 が存在する場合のみ、箱の中の4スロットのうち3箇所へ自動配置
+            if "box_ball_0" in env.scene.keys():  # noqa: SIM118
+                from .task import BOX_WALL_THICKNESS
+
+                slots = box_pose.new_tensor(
+                    [[-0.027, -0.027], [0.027, -0.027], [-0.027, 0.027], [0.027, 0.027]]
+                )
+                perms = torch.argsort(torch.rand(n, 4, device=env.device), dim=-1)
+                zero_vel = torch.zeros((n, 6), device=env.device)
+                for slot_idx, name in enumerate(("box_ball_0", "box_ball_1", "box_ball_2")):
+                    if name in env.scene.keys():  # noqa: SIM118
+                        chosen = slots[perms[:, slot_idx]]
+                        b_pose = box_pose.clone()
+                        b_pose[:, :2] += chosen
+                        b_pose[:, 2] += BOX_WALL_THICKNESS + radii
+                        env.scene[name].write_root_pose_to_sim_index(root_pose=b_pose, env_ids=ids)
+                        env.scene[name].write_root_velocity_to_sim_index(root_velocity=zero_vel, env_ids=ids)
+                # 4番目のスロット（空きスロット）を検証用に記録
+                if not hasattr(env, "_so101_empty_slot_offset"):
+                    env._so101_empty_slot_offset = torch.zeros((env.num_envs, 2), device=env.device)
+                env._so101_empty_slot_offset[ids] = slots[perms[:, 3]]
 
         # 4. 追跡フラグの初期化
         # 把持スタートでも grasped は最初から立てない。実際に保持できているかは進捗判定（両爪接触＋浮上が
