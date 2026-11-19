@@ -47,13 +47,13 @@ class SO101VLMSceneCfg(SO101SceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.33, -0.10, 0.066), rot=(0.0, 0.0, 0.0, 1.0)),
     )
 
-    # 箱の上空（z=0.45m）から真下を見下ろす俯瞰カメラ（画像の上=ロボット前方+X, 画像の右=ロボット右側-Y）
+    # 箱の上空（z=0.45m）から真下を見下ろす俯瞰カメラ（XYZW順: 画像の上=ロボット前方+X, 画像の右=ロボット右側-Y）
     overhead_camera = CameraCfg(
         prim_path="{ENV_REGEX_NS}/OverheadCamera",
         spawn=PinholeCameraCfg(focal_length=18.0, horizontal_aperture=20.955),
         offset=CameraCfg.OffsetCfg(
             pos=(0.33, -0.10, 0.45),
-            rot=(0.0, 0.7071068, -0.7071068, 0.0),
+            rot=(0.7071068, -0.7071068, 0.0, 0.0),
             convention="ros",
         ),
         data_types=["rgb"],

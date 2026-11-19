@@ -148,7 +148,8 @@ def main() -> None:
 
     for ep in range(args_cli.episodes):
         obs, _ = vec_env.reset()
-        # 俯瞰カメラを1ステップ分レンダリングして最新画像を取得
+        # reset() 直後は未描画のため、sim.render() を呼んでから最新フレームを取得する
+        base_env.sim.render()
         base_env.scene.sensors["overhead_camera"].update(dt=base_env.step_dt)
         rgb = base_env.scene.sensors["overhead_camera"].data.output["rgb"].torch
 

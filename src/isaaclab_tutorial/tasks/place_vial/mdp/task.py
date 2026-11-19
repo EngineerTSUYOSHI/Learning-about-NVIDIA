@@ -24,10 +24,10 @@ BALL_RADIUS = 0.025
 """基準のボール半径 [m]（直径50mm = 5cm。env._so101_ball_radius が無い場合のフォールバック値）"""
 BALL_REST_HEIGHT = 0.035 + BALL_RADIUS
 """基準の静止高さ [m]（机35mm + 基準半径）"""
-BALL_LIFT_TARGET_HEIGHT = 0.035 + BOX_HEIGHT + 0.035
-"""箱の壁（BOX_HEIGHT）を余裕をもって越えられる持ち上げ目標高さ [m]（BOX_HEIGHT=0.05 のとき 0.120m）"""
-BALL_PLACE_APPROACH_HEIGHT = 0.035 + BOX_HEIGHT + 0.015
-"""箱への水平移動を開始する最低高さ [m]（BOX_HEIGHT=0.05 のとき 0.100m）"""
+BALL_LIFT_TARGET_HEIGHT = 0.035 + BOX_HEIGHT + BALL_RADIUS + 0.010
+"""箱の壁（BOX_HEIGHT）を余裕をもって越えられる持ち上げ目標高さ [m]（直径5cm時 0.120m）"""
+BALL_PLACE_APPROACH_HEIGHT = 0.035 + BOX_HEIGHT + BALL_RADIUS + 0.005
+"""箱への水平移動を開始する最低高さ [m]（ボール下端が壁上端を越える高さ、直径5cm時 0.115m）"""
 BALL_LIFT_MIN_HEIGHT = BALL_REST_HEIGHT + 0.004
 """基準の浮上判定高さ [m]（静止高さ+4mm）"""
 

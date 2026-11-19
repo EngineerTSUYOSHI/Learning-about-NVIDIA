@@ -597,24 +597,6 @@ class SO101SceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # --- 将来用（Lv1検証: 箱の中に既存ボールを3個配置する場合）---
-    # 有効にする場合は以下のコメントアウトを解除し、events.py の配置ロジックも有効にしてください。
-    # box_ball_0 = RigidObjectCfg(
-    #     prim_path="{ENV_REGEX_NS}/BoxBall0",
-    #     spawn=BallSpawnCfg(usd_path=str(BALL_USD)),
-    #     init_state=RigidObjectCfg.InitialStateCfg(pos=(0.33, -0.10, 0.066), rot=(0.0, 0.0, 0.0, 1.0)),
-    # )
-    # box_ball_1 = RigidObjectCfg(
-    #     prim_path="{ENV_REGEX_NS}/BoxBall1",
-    #     spawn=BallSpawnCfg(usd_path=str(BALL_USD)),
-    #     init_state=RigidObjectCfg.InitialStateCfg(pos=(0.33, -0.10, 0.066), rot=(0.0, 0.0, 0.0, 1.0)),
-    # )
-    # box_ball_2 = RigidObjectCfg(
-    #     prim_path="{ENV_REGEX_NS}/BoxBall2",
-    #     spawn=BallSpawnCfg(usd_path=str(BALL_USD)),
-    #     init_state=RigidObjectCfg.InitialStateCfg(pos=(0.33, -0.10, 0.066), rot=(0.0, 0.0, 0.0, 1.0)),
-    # )
-
     desk = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Desk",
         spawn=sim_utils.UsdFileCfg(usd_path=str(DESK_USD), func=_spawn_usd_with_contact_material),

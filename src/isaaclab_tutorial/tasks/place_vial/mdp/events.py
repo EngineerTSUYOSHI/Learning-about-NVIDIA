@@ -206,6 +206,45 @@ class reset_ball_step1(ManagerTermBase):
         rest_h = ball_rest_height(env)[ids]
         min_lift_h = ball_lift_min_height(env)[ids]
 
+        # 0. 箱（box）を先にランダム配置しておく（把持スタート時の箱干渉チェックに使うため）
+        box_xy_local = None
+        if "box" in env.scene.keys():  # noqa: SIM118
+            from .task import BOX_SIZE
+
+            box_pose = torch.zeros((n, 7), device=env.device)
+            bx = torch.empty(n, device=env.device).uniform_(-box_pos_noise[0], box_pos_noise[0])
+            by = torch.empty(n, device=env.device).uniform_(-box_pos_noise[1], box_pos_noise[1])
+            box_pose[:, 0] = box_pos_center[0] + bx
+            box_pose[:, 1] = box_pos_center[1] + by
+            box_pose[:, 2] = 0.035 + h
+            box_pose[:, 6] = 1.0  # 単位クォータニオン (XYZW: 0, 0, 0, 1)
+            box_xy_local = box_pose[:, :2].clone()
+            box_pose[:, :3] += origins
+            box = env.scene["box"]
+            box.write_root_pose_to_sim_index(root_pose=box_pose, env_ids=ids)
+            box.write_root_velocity_to_sim_index(root_velocity=torch.zeros((n, 6), device=env.device), env_ids=ids)
+
+            # Lv1検証用（VLMタスク等）: シーンに box_ball_0〜2 が存在する場合のみ、箱の中の4スロットのうち3箇所へ自動配置
+            if "box_ball_0" in env.scene.keys():  # noqa: SIM118
+                from .task import BOX_WALL_THICKNESS
+
+                slots = box_pose.new_tensor(
+                    [[-0.027, -0.027], [0.027, -0.027], [-0.027, 0.027], [0.027, 0.027]]
+                )
+                perms = torch.argsort(torch.rand(n, 4, device=env.device), dim=-1)
+                zero_vel = torch.zeros((n, 6), device=env.device)
+                for slot_idx, name in enumerate(("box_ball_0", "box_ball_1", "box_ball_2")):
+                    if name in env.scene.keys():  # noqa: SIM118
+                        chosen = slots[perms[:, slot_idx]]
+                        b_pose = box_pose.clone()
+                        b_pose[:, :2] += chosen
+                        b_pose[:, 2] += BOX_WALL_THICKNESS + radii
+                        env.scene[name].write_root_pose_to_sim_index(root_pose=b_pose, env_ids=ids)
+                        env.scene[name].write_root_velocity_to_sim_index(root_velocity=zero_vel, env_ids=ids)
+                if not hasattr(env, "_so101_empty_slot_offset"):
+                    env._so101_empty_slot_offset = torch.zeros((env.num_envs, 2), device=env.device)
+                env._so101_empty_slot_offset[ids] = slots[perms[:, 3]]
+
         # 各環境を「把持スタート」にするか「通常ホームスタート」にするかを確率 grasp_prob で決定
         is_grasped = torch.rand(n, device=env.device) < grasp_prob
         default_pose = self.default_joint_pos.unsqueeze(0).expand(n, -1)
@@ -221,14 +260,14 @@ class reset_ball_step1(ManagerTermBase):
             blend = torch.empty((n, 1), device=env.device).uniform_(0.0, 0.35)
             grasp_pose = torch.lerp(self.grasp_joint_pos.unsqueeze(0), self.lift_mid_joint_pos.unsqueeze(0), blend)
             noise = torch.zeros_like(grasp_pose)
-            noise[:, 0].uniform_(-0.15, 0.15)  # shoulder_pan
+            noise[:, 0].uniform_(-0.40, 0.40)  # shoulder_pan（ボール出現側にも届くよう広めに設定）
             noise[:, 1].uniform_(-0.03, 0.03)  # shoulder_lift
             noise[:, 2].uniform_(-0.03, 0.03)  # elbow_flex
             grasp_pose = grasp_pose + noise
             # 各環境のボール直径＋クリアランスになる角度をテーブルから算出
             grasp_pose[:, 5] = self._grip_angles_for_radii(radii, grip_clearance)
 
-            # FKで爪の位置を確認し、机にめり込む姿勢・最初から目標高さ付近にある姿勢は通常スタートに切り替える
+            # FKで爪の位置を確認し、机にめり込む姿勢・最初から目標高さ付近にある姿勢・箱と重なる姿勢は通常スタートへ
             robot.write_joint_position_to_sim_index(
                 position=torch.where(is_grasped.unsqueeze(-1), grasp_pose, default_pose), env_ids=ids
             )
@@ -236,6 +275,7 @@ class reset_ball_step1(ManagerTermBase):
             jaw_center_w = grasp_center_w(env)[ids]
             fixed_w, moving_w = fingertip_positions_w(env)
             lowest_tip = torch.minimum(fixed_w[ids, 2], moving_w[ids, 2]) - origins[:, 2]
+            center_xy = jaw_center_w[:, :2] - origins[:, :2]
             center_z = jaw_center_w[:, 2] - origins[:, 2]
             desk_top = 0.035 + h
             valid = (
@@ -243,6 +283,14 @@ class reset_ball_step1(ManagerTermBase):
                 & (center_z <= BALL_LIFT_TARGET_HEIGHT - 0.01)
                 & (lowest_tip >= desk_top + 0.002)
             )
+            if box_xy_local is not None:
+                # 爪・ボールが箱の壁と重ならないよう XY クリアランス（箱半径 + ボール半径 + 2cm）を確保
+                clear_half = 0.5 * BOX_SIZE + radii + 0.020
+                in_box_footprint = (
+                    ((center_xy[:, 0] - box_xy_local[:, 0]).abs() < clear_half)
+                    & ((center_xy[:, 1] - box_xy_local[:, 1]).abs() < clear_half)
+                )
+                valid &= ~in_box_footprint
             is_grasped &= valid
 
         # 2. ロボット関節角度・目標角度の確定
@@ -276,42 +324,6 @@ class reset_ball_step1(ManagerTermBase):
         ball = env.scene["ball"]
         ball.write_root_pose_to_sim_index(root_pose=ball_world_pos, env_ids=ids)
         ball.write_root_velocity_to_sim_index(root_velocity=torch.zeros((n, 6), device=env.device), env_ids=ids)
-
-        # 3-2. 箱（box）も指定範囲でランダム配置する（机の高さ z=0.035 + マット高さ h）
-        if "box" in env.scene.keys():  # noqa: SIM118
-            box_pose = torch.zeros((n, 7), device=env.device)
-            bx = torch.empty(n, device=env.device).uniform_(-box_pos_noise[0], box_pos_noise[0])
-            by = torch.empty(n, device=env.device).uniform_(-box_pos_noise[1], box_pos_noise[1])
-            box_pose[:, 0] = box_pos_center[0] + bx
-            box_pose[:, 1] = box_pos_center[1] + by
-            box_pose[:, 2] = 0.035 + h
-            box_pose[:, 6] = 1.0  # 単位クォータニオン (XYZW: 0, 0, 0, 1)
-            box_pose[:, :3] += origins
-            box = env.scene["box"]
-            box.write_root_pose_to_sim_index(root_pose=box_pose, env_ids=ids)
-            box.write_root_velocity_to_sim_index(root_velocity=torch.zeros((n, 6), device=env.device), env_ids=ids)
-
-            # Lv1検証用（VLMタスク等）: シーンに box_ball_0〜2 が存在する場合のみ、箱の中の4スロットのうち3箇所へ自動配置
-            if "box_ball_0" in env.scene.keys():  # noqa: SIM118
-                from .task import BOX_WALL_THICKNESS
-
-                slots = box_pose.new_tensor(
-                    [[-0.027, -0.027], [0.027, -0.027], [-0.027, 0.027], [0.027, 0.027]]
-                )
-                perms = torch.argsort(torch.rand(n, 4, device=env.device), dim=-1)
-                zero_vel = torch.zeros((n, 6), device=env.device)
-                for slot_idx, name in enumerate(("box_ball_0", "box_ball_1", "box_ball_2")):
-                    if name in env.scene.keys():  # noqa: SIM118
-                        chosen = slots[perms[:, slot_idx]]
-                        b_pose = box_pose.clone()
-                        b_pose[:, :2] += chosen
-                        b_pose[:, 2] += BOX_WALL_THICKNESS + radii
-                        env.scene[name].write_root_pose_to_sim_index(root_pose=b_pose, env_ids=ids)
-                        env.scene[name].write_root_velocity_to_sim_index(root_velocity=zero_vel, env_ids=ids)
-                # 4番目のスロット（空きスロット）を検証用に記録
-                if not hasattr(env, "_so101_empty_slot_offset"):
-                    env._so101_empty_slot_offset = torch.zeros((env.num_envs, 2), device=env.device)
-                env._so101_empty_slot_offset[ids] = slots[perms[:, 3]]
 
         # 4. 追跡フラグの初期化
         # 把持スタートでも grasped は最初から立てない。実際に保持できているかは進捗判定（両爪接触＋浮上が
