@@ -11,23 +11,25 @@ from isaaclab.utils.math import quat_apply
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-# タスクの基準幾何学定数 [m]（環境ごとの動的サイズがある場合は ball_radius(env) 等を優先する）
-BALL_RADIUS = 0.025
-"""基準のボール半径 [m]（直径50mm = 5cm。env._so101_ball_radius が無い場合のフォールバック値）"""
-BALL_REST_HEIGHT = 0.035 + BALL_RADIUS
-"""基準の静止高さ [m]（机35mm + 基準半径）"""
-BALL_LIFT_TARGET_HEIGHT = 0.130
-"""箱の壁（高さ5cm）を余裕をもって越えられる持ち上げ目標高さ [m]"""
-BALL_LIFT_MIN_HEIGHT = BALL_REST_HEIGHT + 0.004
-"""基準の浮上判定高さ [m]（静止高さ+4mm）"""
-
-# 箱（カゴ）の幾何学定数 [m]（外寸 11cm x 11cm x 高さ5cm）
-BOX_SIZE = 0.11
+# 箱（カゴ）の幾何学定数 [m]（外寸 12cm x 12cm x 高さ5cm）
+BOX_SIZE = 0.12
 """箱の外寸（幅・奥行） [m]"""
 BOX_HEIGHT = 0.05
 """箱の高さ [m]"""
 BOX_WALL_THICKNESS = 0.006
 """箱の壁・底板の厚み [m]"""
+
+# タスクの基準幾何学定数 [m]（環境ごとの動的サイズがある場合は ball_radius(env) 等を優先する）
+BALL_RADIUS = 0.025
+"""基準のボール半径 [m]（直径50mm = 5cm。env._so101_ball_radius が無い場合のフォールバック値）"""
+BALL_REST_HEIGHT = 0.035 + BALL_RADIUS
+"""基準の静止高さ [m]（机35mm + 基準半径）"""
+BALL_LIFT_TARGET_HEIGHT = 0.035 + BOX_HEIGHT + 0.035
+"""箱の壁（BOX_HEIGHT）を余裕をもって越えられる持ち上げ目標高さ [m]（BOX_HEIGHT=0.05 のとき 0.120m）"""
+BALL_PLACE_APPROACH_HEIGHT = 0.035 + BOX_HEIGHT + 0.015
+"""箱への水平移動を開始する最低高さ [m]（BOX_HEIGHT=0.05 のとき 0.100m）"""
+BALL_LIFT_MIN_HEIGHT = BALL_REST_HEIGHT + 0.004
+"""基準の浮上判定高さ [m]（静止高さ+4mm）"""
 
 FIXED_FINGERTIP_OFFSET = (-0.01289, -0.00022, -0.0986)
 MOVING_FINGERTIP_OFFSET = (-0.0068, -0.0766, 0.0189)

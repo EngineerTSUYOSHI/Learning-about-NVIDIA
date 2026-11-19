@@ -179,8 +179,10 @@ class reset_ball_step1(ManagerTermBase):
         self,
         env: ManagerBasedRLEnv,
         env_ids: torch.Tensor | None,
-        ball_pos_center: tuple[float, float] = (0.36, 0.0),
+        ball_pos_center: tuple[float, float] = (0.33, 0.08),
         ball_pos_noise: tuple[float, float] = (0.03, 0.04),
+        box_pos_center: tuple[float, float] = (0.33, -0.10),
+        box_pos_noise: tuple[float, float] = (0.03, 0.04),
         grasp_prob: float = 0.0,
         grip_clearance: float = 0.001,
         grip_squeeze: float = 0.15,
@@ -274,6 +276,38 @@ class reset_ball_step1(ManagerTermBase):
         ball = env.scene["ball"]
         ball.write_root_pose_to_sim_index(root_pose=ball_world_pos, env_ids=ids)
         ball.write_root_velocity_to_sim_index(root_velocity=torch.zeros((n, 6), device=env.device), env_ids=ids)
+
+        # 3-2. 箱（box）も指定範囲でランダム配置する（机の高さ z=0.035 + マット高さ h）
+        if "box" in env.scene.keys():  # noqa: SIM118
+            box_pose = torch.zeros((n, 7), device=env.device)
+            bx = torch.empty(n, device=env.device).uniform_(-box_pos_noise[0], box_pos_noise[0])
+            by = torch.empty(n, device=env.device).uniform_(-box_pos_noise[1], box_pos_noise[1])
+            box_pose[:, 0] = box_pos_center[0] + bx
+            box_pose[:, 1] = box_pos_center[1] + by
+            box_pose[:, 2] = 0.035 + h
+            box_pose[:, 6] = 1.0  # 単位クォータニオン (XYZW: 0, 0, 0, 1)
+            box_pose[:, :3] += origins
+            box = env.scene["box"]
+            box.write_root_pose_to_sim_index(root_pose=box_pose, env_ids=ids)
+            box.write_root_velocity_to_sim_index(root_velocity=torch.zeros((n, 6), device=env.device), env_ids=ids)
+
+            # --- 将来用（Lv1検証: 箱の中の4スロットのうちランダムに3箇所へ既存ボールを配置）---
+            # env_cfg.py の box_ball_0〜2 を有効にした上で、以下をコメントアウト解除してください。
+            # from .task import BOX_WALL_THICKNESS
+            # slots = box_pose.new_tensor(
+            #     [[-0.027, -0.027], [0.027, -0.027], [-0.027, 0.027], [0.027, 0.027]]
+            # )
+            # # 各環境ごとに4つのスロットをシャッフルし、先頭3つを既存ボール、残り1つを空きスペースにする
+            # perms = torch.argsort(torch.rand(n, 4, device=env.device), dim=-1)
+            # zero_vel = torch.zeros((n, 6), device=env.device)
+            # for slot_idx, name in enumerate(("box_ball_0", "box_ball_1", "box_ball_2")):
+            #     if name in env.scene.keys():  # noqa: SIM118
+            #         chosen = slots[perms[:, slot_idx]]
+            #         b_pose = box_pose.clone()
+            #         b_pose[:, :2] += chosen
+            #         b_pose[:, 2] += BOX_WALL_THICKNESS + radii
+            #         env.scene[name].write_root_pose_to_sim_index(root_pose=b_pose, env_ids=ids)
+            #         env.scene[name].write_root_velocity_to_sim_index(root_velocity=zero_vel, env_ids=ids)
 
         # 4. 追跡フラグの初期化
         # 把持スタートでも grasped は最初から立てない。実際に保持できているかは進捗判定（両爪接触＋浮上が

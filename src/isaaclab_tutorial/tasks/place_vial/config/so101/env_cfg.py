@@ -580,22 +580,40 @@ class SO101SceneCfg(InteractiveSceneCfg):
             activate_contact_sensors=True,
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
-            # ロボットの爪の下（前方約26cm）に配置
-            pos=(0.36, 0.0, mdp.BALL_REST_HEIGHT),
+            # ロボットの少し左前に配置（実際の各エピソード位置は reset_ball でランダム決定）
+            pos=(0.33, 0.08, mdp.BALL_REST_HEIGHT),
             rot=(0.0, 0.0, 0.0, 1.0),
         ),
     )
 
-    # プリミティブ生成の上開き箱（11cm x 11cm x 高さ5cm、ロボットの背面側に配置）
+    # プリミティブ生成の上開き箱（12cm x 12cm x 高さ5cm、ロボットの少し右前に配置）
     box = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Box",
-        spawn=OpenBoxSpawnCfg(size=0.11, height=0.05, wall_thickness=0.006),
+        spawn=OpenBoxSpawnCfg(size=0.12, height=0.05, wall_thickness=0.006),
         init_state=RigidObjectCfg.InitialStateCfg(
-            # ロボット(0.10, 0.0)から見て背面側（斜め後ろ: shoulder_panの可動域内で無理なく届く位置）
-            pos=(-0.04, 0.12, 0.035),
+            # ロボットの少し右前に配置（実際の各エピソード位置は reset_ball でランダム決定）
+            pos=(0.33, -0.10, 0.035),
             rot=(0.0, 0.0, 0.0, 1.0),
         ),
     )
+
+    # --- 将来用（Lv1検証: 箱の中に既存ボールを3個配置する場合）---
+    # 有効にする場合は以下のコメントアウトを解除し、events.py の配置ロジックも有効にしてください。
+    # box_ball_0 = RigidObjectCfg(
+    #     prim_path="{ENV_REGEX_NS}/BoxBall0",
+    #     spawn=BallSpawnCfg(usd_path=str(BALL_USD)),
+    #     init_state=RigidObjectCfg.InitialStateCfg(pos=(0.33, -0.10, 0.066), rot=(0.0, 0.0, 0.0, 1.0)),
+    # )
+    # box_ball_1 = RigidObjectCfg(
+    #     prim_path="{ENV_REGEX_NS}/BoxBall1",
+    #     spawn=BallSpawnCfg(usd_path=str(BALL_USD)),
+    #     init_state=RigidObjectCfg.InitialStateCfg(pos=(0.33, -0.10, 0.066), rot=(0.0, 0.0, 0.0, 1.0)),
+    # )
+    # box_ball_2 = RigidObjectCfg(
+    #     prim_path="{ENV_REGEX_NS}/BoxBall2",
+    #     spawn=BallSpawnCfg(usd_path=str(BALL_USD)),
+    #     init_state=RigidObjectCfg.InitialStateCfg(pos=(0.33, -0.10, 0.066), rot=(0.0, 0.0, 0.0, 1.0)),
+    # )
 
     desk = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Desk",
@@ -745,14 +763,16 @@ class EventsCfg:
             "operation": "abs",
         },
     )
-    # 机の上にボールをランダム配置してロボットを初期姿勢にするリセット
+    # 机の上にボール（左下）と箱（右下）をランダム配置してロボットを初期姿勢にするリセット
     # ※下の "grasp_prob": 0.3 をコメントアウト（または 0.0）にすれば、把持スタートをOFF（100%机スタート）にできます
     reset_ball = EventTerm(
         func=mdp.reset_ball_step1,
         mode="reset",
         params={
-            "ball_pos_center": (0.36, 0.0),
+            "ball_pos_center": (0.33, 0.08),
             "ball_pos_noise": (0.03, 0.04),
+            "box_pos_center": (0.33, -0.10),
+            "box_pos_noise": (0.03, 0.04),
             "grasp_prob": 0.3,  # ← ここをコメントアウトすれば把持スタートOFF
         },
     )
@@ -835,8 +855,8 @@ class RewardsCfg:
     )
     # 持ち上げシェーピング報酬: ボールを浮かせている間、箱の壁を越える目標高さに近づくほど加点
     lift_progress = RewTerm(func=mdp.lift_progress, weight=0.3, params={"pinch_bonus": 0.1})
-    # 箱誘導報酬: 安全高さまで持ち上げた後、壁を越えて箱の中へ運ぶほど加点（ホバリング稼ぎを防ぐため重み0.15）
-    place_goal = RewTerm(func=mdp.place_goal, weight=0.15, params={"std": 0.12})
+    # 箱誘導報酬: 安全高さまで持ち上げた後、壁を越えて箱の中へ運ぶほど加点（stdを広げて保持直後から誘導を効かせる）
+    place_goal = RewTerm(func=mdp.place_goal, weight=0.25, params={"std": 0.20})
     # マイルストーン報酬: 把持(+10.0), 安全高さリフト(+20.0), 箱投入＆リリース(+40.0) の1回限りボーナス
     milestones = RewTerm(
         func=mdp.milestones, weight=1.0, params={"grasp_bonus": 10.0, "lift_bonus": 20.0, "place_bonus": 40.0}

@@ -12,7 +12,10 @@ from isaaclab.managers import ManagerTermBase, RewardTermCfg
 from .progress import ball_place_progress
 from .task import (
     BALL_LIFT_TARGET_HEIGHT,
+    BALL_PLACE_APPROACH_HEIGHT,
+    BOX_WALL_THICKNESS,
     ball_grasp_point_w,
+    ball_height,
     ball_in_box,
     ball_in_jaws,
     ball_is_holding,
@@ -70,16 +73,17 @@ def lift_progress(
     return torch.where(progress_state.lifted | progress_state.placed, 0.0, raw)
 
 
-def place_goal(env: ManagerBasedRLEnv, std: float = 0.12) -> torch.Tensor:
+def place_goal(env: ManagerBasedRLEnv, std: float = 0.20) -> torch.Tensor:
     """安全高さまで持ち上げた後、壁を越えて箱の上空→箱の内側へ誘導し、リリースを促す報酬。
 
-    1. ``progress_state.lifted``（目標高さ到達）までは発動させず、まず壁を越える高さまで上げさせる。
+    1. 目標高さ（``lifted``）または保持したまま高さ ``0.10m`` 以上に達してから発動し、壁への衝突を防ぐ。
     2. 箱のXY範囲に入るまでは壁上空の高さ（``BALL_LIFT_TARGET_HEIGHT``）を維持させ、壁の角への衝突を防ぐ。
     3. 箱のXY範囲に入ったら箱の底付近へ降ろし、指を開く（``gripper_openness``）ことで投入完了を促す。
     """
     progress_state = ball_place_progress(env)
-    # 壁を越える高さ（lifted）に達してから箱への誘導を開始し、箱の壁に引っかかるのを防ぐ
-    active = progress_state.lifted & ~progress_state.placed
+    holding = ball_is_holding(env)
+    # 箱の中で指を開いた直後も報酬が切れないよう lifted も条件に含め、placed 完了まで維持する
+    active = (progress_state.lifted | (holding & (ball_height(env) >= BALL_PLACE_APPROACH_HEIGHT))) & ~progress_state.placed
 
     ball_pos = ball_grasp_point_w(env)
     box_pos = env.scene["box"].data.root_pos_w.torch
@@ -87,7 +91,7 @@ def place_goal(env: ManagerBasedRLEnv, std: float = 0.12) -> torch.Tensor:
 
     target = box_pos.clone()
     above_wall_z = env.scene.env_origins[:, 2] + BALL_LIFT_TARGET_HEIGHT
-    inside_box_z = box_pos[:, 2] + 0.040
+    inside_box_z = box_pos[:, 2] + BOX_WALL_THICKNESS + 0.035
     target[:, 2] = torch.where(in_box_xy, inside_box_z, above_wall_z)
 
     dist = torch.linalg.vector_norm(ball_pos - target, dim=-1)
