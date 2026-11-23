@@ -6,7 +6,11 @@ __all__ = [
     "BOX_HEIGHT",
     "BOX_SIZE",
     "BOX_WALL_THICKNESS",
+    "SLOT_OFFSETS",
+    "VLMGuidedArmActionCfg",
+    "VLMGuidedGripperActionCfg",
     "approach_progress",
+    "ask_local_vlm_empty_slot",
     "ball_dropped",
     "ball_place_success",
     "encoder_joint_pos",
@@ -23,6 +27,7 @@ __all__ = [
     "randomize_wrist_camera_mount",
     "reset_ball_step1",
     "success",
+    "vlm_box_state_b",
     "wrist_rgb",
     "abnormal_robot_state",
     "body_state_b",
@@ -58,3 +63,10 @@ from .task import (
     BOX_WALL_THICKNESS,
 )
 from .terminations import ball_dropped, ball_place_success
+from .vlm_control import (
+    SLOT_OFFSETS,
+    VLMGuidedArmActionCfg,
+    VLMGuidedGripperActionCfg,
+    ask_local_vlm_empty_slot,
+    vlm_box_state_b,
+)
