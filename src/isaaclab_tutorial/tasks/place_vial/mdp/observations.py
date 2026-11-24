@@ -35,9 +35,9 @@ def encoder_joint_target(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> t
 
 
 def progress_flags(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """把持・リフト・箱投入のマイルストーン達成フラグ（マルコフ性を保つための観測）。"""
+    """Ver4: 把持・リフトのマイルストーン達成フラグ（マルコフ性を保つための観測）。"""
     progress = ball_place_progress(env)
-    return torch.stack((progress.grasped, progress.lifted, progress.placed), dim=-1).float()
+    return torch.stack((progress.grasped, progress.lifted), dim=-1).float()
 
 
 def jaw_contact_flags(env: ManagerBasedRLEnv) -> torch.Tensor:

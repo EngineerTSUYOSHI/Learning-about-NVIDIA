@@ -30,6 +30,8 @@ BALL_PLACE_APPROACH_HEIGHT = 0.035 + BOX_HEIGHT + BALL_RADIUS + 0.005
 """箱への水平移動を開始する最低高さ [m]（ボール下端が壁上端を越える高さ、直径5cm時 0.115m）"""
 BALL_LIFT_MIN_HEIGHT = BALL_REST_HEIGHT + 0.004
 """基準の浮上判定高さ [m]（静止高さ+4mm）"""
+BALL_PICK_LIFT_DELTA = 0.040
+"""Ver4 純粋把持（Pick）モデルにおける目標持ち上げ変位 [m]（静止高さ+4cmで把持完了とみなす）"""
 
 FIXED_FINGERTIP_OFFSET = (-0.01289, -0.00022, -0.0986)
 MOVING_FINGERTIP_OFFSET = (-0.0068, -0.0766, 0.0189)
@@ -51,6 +53,11 @@ def ball_rest_height(env: ManagerBasedRLEnv) -> torch.Tensor:
 def ball_lift_min_height(env: ManagerBasedRLEnv) -> torch.Tensor:
     """各環境でボールが机から確実に浮いたと判定する最小高さ [m]（静止高さ + 4mm）を返す。"""
     return ball_rest_height(env) + 0.004
+
+
+def ball_pick_target_height(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Ver4 純粋把持（Pick）モデルにおける各環境の目標持ち上げ高さ [m]（静止高さ + 4cm）を返す。"""
+    return ball_rest_height(env) + BALL_PICK_LIFT_DELTA
 
 
 def contact_force(env: ManagerBasedRLEnv, sensor_name: str) -> torch.Tensor:

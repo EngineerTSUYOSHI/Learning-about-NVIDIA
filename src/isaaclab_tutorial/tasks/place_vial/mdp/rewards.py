@@ -20,6 +20,7 @@ from .task import (
     ball_in_jaws,
     ball_is_holding,
     ball_lift_height_progress,
+    ball_pick_target_height,
     ball_rest_height,
     contact_force,
     grasp_center_w,
@@ -55,22 +56,20 @@ class approach_progress(ManagerTermBase):
 
 def lift_progress(
     env: ManagerBasedRLEnv,
-    target_height: float = BALL_LIFT_TARGET_HEIGHT,
+    target_height: float | None = None,
     pinch_bonus: float = 0.1,
 ) -> torch.Tensor:
-    """爪の間でボールを挟んだ状態（``pinch_bonus``）から、箱の壁を越える目標高さまで持ち上げる密な報酬。
+    """爪の間でボールを挟んだ状態（``pinch_bonus``）から、目標持ち上げ高さまで持ち上げる密な報酬。
 
-    すでに目標高さへ到達（``lifted``）した後は、箱への運搬（``place_goal``）に集中できるよう加点を止める。
+    Ver4では、静止高さ+4cmまで持ち上げて把持が安定するまで加点する。
     """
-    progress_state = ball_place_progress(env)
     in_jaws = ball_in_jaws(env)
     holding = ball_is_holding(env)
-    target = target_height if target_height > 0.0 else BALL_LIFT_TARGET_HEIGHT
+    target = ball_pick_target_height(env) if target_height is None else torch.full((env.num_envs,), target_height, device=env.device)
     max_travel = (target - ball_rest_height(env)).clamp_min(0.01)
     height_ratio = (ball_lift_height_progress(env) / max_travel).clamp(0.0, 1.0)
     lift_score = pinch_bonus + (1.0 - pinch_bonus) * height_ratio
-    raw = torch.where(holding, lift_score, torch.where(in_jaws, pinch_bonus, 0.0))
-    return torch.where(progress_state.lifted | progress_state.placed, 0.0, raw)
+    return torch.where(holding, lift_score, torch.where(in_jaws, pinch_bonus, 0.0))
 
 
 def place_goal(env: ManagerBasedRLEnv, std: float = 0.20) -> torch.Tensor:
@@ -102,12 +101,12 @@ def place_goal(env: ManagerBasedRLEnv, std: float = 0.20) -> torch.Tensor:
 
 
 class milestones(ManagerTermBase):
-    """エピソード中に一度だけ支払われるマイルストーン報酬（把持: 10.0, リフト: 20.0, 箱投入: 40.0）。"""
+    """エピソード中に一度だけ支払われるマイルストーン報酬（把持: 10.0, リフト: 20.0）。"""
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        # 0=grasped(把持), 1=lifted(安全高さ到達), 2=placed(箱投入＆リリース)
-        self.paid = torch.zeros((self.num_envs, 3), dtype=torch.bool, device=self.device)
+        # 0=grasped(把持), 1=lifted(安全高さ到達)
+        self.paid = torch.zeros((self.num_envs, 2), dtype=torch.bool, device=self.device)
         self.started = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
@@ -120,11 +119,11 @@ class milestones(ManagerTermBase):
         env: ManagerBasedRLEnv,
         grasp_bonus: float = 10.0,
         lift_bonus: float = 20.0,
-        place_bonus: float = 40.0,
+        place_bonus: float = 0.0,
     ) -> torch.Tensor:
         progress = ball_place_progress(env)
-        reached = torch.stack((progress.grasped, progress.lifted, progress.placed), dim=-1)
-        bonus = torch.tensor((grasp_bonus, lift_bonus, place_bonus), dtype=torch.float32, device=self.device)
+        reached = torch.stack((progress.grasped, progress.lifted), dim=-1)
+        bonus = torch.tensor((grasp_bonus, lift_bonus), dtype=torch.float32, device=self.device)
         reward = ((reached & ~self.paid).float() * bonus).sum(-1)
         reward = torch.where(self.started, reward, 0.0)
         self.paid = reached.clone()

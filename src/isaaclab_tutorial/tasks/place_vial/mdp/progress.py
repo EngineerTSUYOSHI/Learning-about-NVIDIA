@@ -6,12 +6,12 @@ import torch
 
 
 class BallPlaceProgress:
-    """エピソード単位のマイルストーンを保持するクラス。
+    """エピソード単位のマイルストーンを保持するクラス（Ver4: 純粋Pick特化）。
 
     * ``grasped``: 両爪でボールを机から浮かせて ``grasp_steps`` 連続保持した状態
-    * ``lifted``: ボールが箱の壁を越えられる安全高さに到達した状態
-    * ``placed``: ボールを箱の中に投入してグリッパーを放した状態
-    * ``success``: 箱の中で ``stable_steps`` 連続静止してタスク成功となった状態
+    * ``lifted``: ボールが目標高さ（静止高さ+4cm）に到達した状態
+    * ``placed``: （互換性用）箱投入フラグ
+    * ``success``: 目標高さまで持ち上げたまま ``stable_steps`` 連続安定保持した状態
     """
 
     def __init__(self, num_envs: int, device: str | torch.device, stable_steps: int = 10, grasp_steps: int = 2):
@@ -36,6 +36,24 @@ class BallPlaceProgress:
         self.stable_count[ids] = 0
         self.time_to_success[ids] = -1
 
+    def update_pick(
+        self,
+        holding: torch.Tensor,
+        lifted: torch.Tensor,
+        step: torch.Tensor,
+    ) -> torch.Tensor:
+        """Ver4: 把持＆持ち上げの物理状態から進捗を更新し、安定保持成功フラグを返す。"""
+        self.grasp_count.copy_(torch.where(holding, self.grasp_count + 1, torch.zeros_like(self.grasp_count)))
+        self.grasped |= self.grasp_count >= self.grasp_steps
+        self.lifted |= lifted
+        # 目標高さまで持ち上げ、かつ現在も保持（holding）している安定状態をカウント
+        stable_holding = lifted & holding
+        self.stable_count.copy_(torch.where(stable_holding, self.stable_count + 1, torch.zeros_like(self.stable_count)))
+        newly_successful = ~self.success & (self.stable_count >= self.stable_steps)
+        self.time_to_success.copy_(torch.where(newly_successful, step, self.time_to_success))
+        self.success |= newly_successful
+        return self.success.clone()
+
     def update(
         self,
         holding: torch.Tensor,
@@ -44,7 +62,7 @@ class BallPlaceProgress:
         settled: torch.Tensor,
         step: torch.Tensor,
     ) -> torch.Tensor:
-        """現在の物理状態からマイルストーンを更新し、成功確定フラグを返す。"""
+        """旧互換（Place用）の進捗更新。"""
         self.grasp_count.copy_(torch.where(holding, self.grasp_count + 1, torch.zeros_like(self.grasp_count)))
         self.grasped |= self.grasp_count >= self.grasp_steps
         self.lifted |= lifted
@@ -56,8 +74,16 @@ class BallPlaceProgress:
         return self.success.clone()
 
 
+BallPickProgress = BallPlaceProgress
+
+
 def ball_place_progress(env) -> BallPlaceProgress:
     """終了判定・報酬・観測で共有する進捗インスタンスを返す。"""
     if not hasattr(env, "_so101_ball_place_progress"):
         env._so101_ball_place_progress = BallPlaceProgress(env.num_envs, env.device)
     return env._so101_ball_place_progress
+
+
+def ball_pick_progress(env) -> BallPickProgress:
+    """Ver4用進捗インスタンスのエイリアス。"""
+    return ball_place_progress(env)

@@ -695,12 +695,7 @@ class PolicyStateGroupCfg(ObsGroup):
         func=mdp.body_state_b,
         params={"body_asset_cfg": SceneEntityCfg("ball"), "base_asset_cfg": SceneEntityCfg("robot")},
     )
-    # 箱（カゴ）の位置観測を追加
-    box = ObsTerm(
-        func=mdp.body_state_b,
-        params={"body_asset_cfg": SceneEntityCfg("box"), "base_asset_cfg": SceneEntityCfg("robot")},
-    )
-    # 進捗フラグ（把持・リフト・箱投入のマルコフ性維持用）
+    # 進捗フラグ（Ver4: 把持・リフトのマルコフ性維持用。箱はモデル観測から完全除外）
     progress = ObsTerm(func=mdp.progress_flags)
 
     def __post_init__(self):
@@ -829,22 +824,20 @@ class Sim2RealEventsCfg(EventsCfg):
 
 @configclass
 class RewardsCfg:
-    """ボール把持＆箱投入（Pick & Place）報酬設計"""
+    """ボール把持＆リフト（Pick）報酬設計（Ver4: 純粋Pick特化）"""
 
     # ボール中心への接近報酬（球体中心を狙うためオフセットは0）
     approach_progress = RewTerm(
         func=mdp.approach_progress, weight=1.0, params={"height_offset": 0.0}
     )
-    # 持ち上げシェーピング報酬: ボールを浮かせている間、箱の壁を越える目標高さに近づくほど加点
-    lift_progress = RewTerm(func=mdp.lift_progress, weight=0.3, params={"pinch_bonus": 0.1})
-    # 箱誘導報酬: 安全高さまで持ち上げた後、壁を越えて箱の中へ運ぶほど加点（stdを広げて保持直後から誘導を効かせる）
-    place_goal = RewTerm(func=mdp.place_goal, weight=0.25, params={"std": 0.20})
-    # マイルストーン報酬: 把持(+10.0), 安全高さリフト(+20.0), 箱投入＆リリース(+40.0) の1回限りボーナス
+    # 持ち上げシェーピング報酬: ボールを浮かせている間、目標持ち上げ高さ（+4cm）に近づくほど加点
+    lift_progress = RewTerm(func=mdp.lift_progress, weight=0.5, params={"pinch_bonus": 0.1})
+    # マイルストーン報酬: 把持(+10.0), リフト(+20.0) の1回限りボーナス
     milestones = RewTerm(
-        func=mdp.milestones, weight=1.0, params={"grasp_bonus": 10.0, "lift_bonus": 20.0, "place_bonus": 40.0}
+        func=mdp.milestones, weight=1.0, params={"grasp_bonus": 10.0, "lift_bonus": 20.0}
     )
-    # 完了ボーナス: 箱の中で安定静止できた時の成功報酬
-    success = RewTerm(func=mdp.success, weight=200.0)
+    # 完了ボーナス: 目標高さまで持ち上げて安定保持できた時の成功報酬
+    success = RewTerm(func=mdp.success, weight=100.0)
     ball_lost = RewTerm(
         func=mdp.is_terminated_term, weight=-50.0, params={"term_keys": ["ball_out_of_bounds", "ball_dropped"]}
     )
@@ -860,7 +853,7 @@ class RewardsCfg:
 
 @configclass
 class TerminationsCfg:
-    success = DoneTerm(func=mdp.ball_place_success)
+    success = DoneTerm(func=mdp.ball_lift_success)
     ball_dropped = DoneTerm(func=mdp.ball_dropped)
     # ロボットのベース座標系はZ軸周りに+90度回転しているため、机の範囲外を判定
     ball_out_of_bounds = DoneTerm(
@@ -914,8 +907,8 @@ class SO101VialEnvCfg(ManagerBasedRLEnvCfg):
 
     def __post_init__(self):
         self.decimation = 4
-        # The measured shoulder response is slower, so sim2real attempts get more time.
-        self.episode_length_s = preset(default=20.0, sim2real=30.0)
+        # Ver4 Pickタスク: 把持＆持ち上げ完了で即時成功終了するため、タイムアウトを10秒に最適化
+        self.episode_length_s = preset(default=10.0, sim2real=15.0)
         self.is_finite_horizon = False
         self.sim.dt = 1.0 / 120.0
         self.sim.render_interval = self.decimation

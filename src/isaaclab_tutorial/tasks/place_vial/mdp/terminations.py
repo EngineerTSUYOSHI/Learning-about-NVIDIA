@@ -17,6 +17,7 @@ from .task import (
     ball_in_box,
     ball_is_holding,
     ball_lift_min_height,
+    ball_pick_target_height,
     ball_radius,
     contact_force,
     grasp_center_w,
@@ -26,6 +27,50 @@ from .task import (
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+class ball_lift_success(ManagerTermBase):
+    """Ver4: ボールを両爪で把持し、机から目標高さ（+4cm）まで持ち上げて安定静止したら成功とする。"""
+
+    def __init__(self, cfg: TerminationTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.progress = ball_place_progress(env)
+        self.max_support_force = torch.zeros(self.num_envs, device=self.device)
+        self.support_contact_time = torch.zeros_like(self.max_support_force)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        ids = slice(None) if env_ids is None else env_ids
+        self.progress.reset(ids)
+        self.max_support_force[ids] = 0.0
+        self.support_contact_time[ids] = 0.0
+        if hasattr(self._env, "_so101_reset_grasped"):
+            grasped = self._env._so101_reset_grasped[ids]
+            self.progress.grasped[ids] = grasped
+            self.progress.grasp_count[ids] = torch.where(grasped, self.progress.grasp_steps, 0)
+            self.progress.lifted[ids] = self._env._so101_reset_lifted[ids]
+
+    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+        holding = ball_is_holding(env)  # 両爪でボールを挟み、机から浮かせているか
+        lifted = holding & (ball_height(env) >= ball_pick_target_height(env))  # 目標高さ（+4cm）に達したか
+
+        success = self.progress.update_pick(holding, lifted, env.episode_length_buf)
+
+        log = env.extras.setdefault("log", {})
+        log["Metrics/grasp_rate"] = self.progress.grasped.float().mean()
+        log["Metrics/lift_rate"] = self.progress.lifted.float().mean()
+        log["Metrics/success_rate"] = success.float().mean()
+        if "fixed_jaw_support" in env.scene.sensors:
+            support_force = torch.maximum(
+                contact_force(env, "fixed_jaw_support"), contact_force(env, "moving_jaw_support")
+            )
+            self.max_support_force = torch.maximum(self.max_support_force, support_force)
+            self.support_contact_time += (support_force > 1.0).float() * env.step_dt
+            log["Safety/peak_jaw_support_force_n"] = self.max_support_force.mean()
+            env._so101_terminal_max_support_force = self.max_support_force.clone()
+            env._so101_terminal_support_contact_time = self.support_contact_time.clone()
+
+        env._so101_terminal_time_to_success_s = self.progress.time_to_success.float() * env.step_dt
+        return success
 
 
 class ball_place_success(ManagerTermBase):
@@ -92,6 +137,7 @@ class ball_place_success(ManagerTermBase):
 
 
 def ball_dropped(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """一度持ち上げたボールが箱の外の机（マット）の上まで落ちた場合に終了判定を返す。"""
+    """一度持ち上げたボールが机（マット）の上まで落ちた場合に終了判定を返す。"""
     fallen = ball_height(env) < ball_lift_min_height(env)
-    return ball_place_progress(env).lifted & fallen & ~ball_in_box(env)
+    progress = ball_place_progress(env)
+    return progress.lifted & fallen
