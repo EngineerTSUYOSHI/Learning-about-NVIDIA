@@ -27,7 +27,6 @@ __all__ = [
     "randomize_wrist_camera_mount",
     "reset_ball_step1",
     "success",
-    "vlm_box_state_b",
     "wrist_rgb",
     "abnormal_robot_state",
     "body_state_b",
@@ -68,5 +67,4 @@ from .vlm_control import (
     VLMGuidedArmActionCfg,
     VLMGuidedGripperActionCfg,
     ask_local_vlm_empty_slot,
-    vlm_box_state_b,
 )

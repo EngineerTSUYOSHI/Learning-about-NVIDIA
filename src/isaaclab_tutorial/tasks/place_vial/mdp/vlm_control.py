@@ -1,14 +1,15 @@
-"""ステップC（VLM連携＋方法Aハイブリッド制御）用の観測・アクション制御モジュール。
+"""ステップC（VLM連携＋2カメラハイブリッド制御）用のアクション制御モジュール。
 
-方法Aの仕組み:
-1. 把持・持ち上げフェーズ（前半）:
-   実際の箱がどこ（逆方向や移動先）にあっても、強化学習ポリシーの ``box`` 観測には
-   「学習時の基準箱座標 ``(0.33, -0.10, 0.035)``」を渡す。これにより、箱の位置に惑わされず
-   100%確実にボールを掴んで持ち上げさせる。
-2. 箱（空きスロット）への運搬・リリースフェーズ（後半）:
-   ボールが安全高さ（``BALL_PLACE_APPROACH_HEIGHT``）まで持ち上がった瞬間、俯瞰カメラ画像から
-   ローカルVLM（またはモック）で空きスロット座標を判定し、事前キャリブレーション済みのFKテーブルで
-   空きスロット真上へアームを誘導して指を開き、正確に投入する。
+制御の流れ:
+1. 開始直後（アームがホーム姿勢で箱を隠していない時）:
+   全体俯瞰カメラ（``overhead_camera``）の映像から箱の領域を切り抜き（クロップ＋2x2十字線描画）、
+   ローカルVLM（未接続または ``SO101_VLM_MODE=mock`` 時は環境の空きスロット座標）で空きスペースを記憶する。
+2. 前半（把持・持ち上げフェーズ）:
+   学習済み強化学習モデル（.pt）の行動をそのまま通し、ボールを掴んで安全高さまで持ち上げさせる。
+3. 後半（運搬・投入フェーズ）:
+   安全高さ（``BALL_PLACE_APPROACH_HEIGHT``）に達した瞬間、手首の回転角（``wrist_roll``）を維持したまま
+   FKテーブル補間で記憶した空きスロットの真上へ誘導し、位置誤差 1.5cm 以内＆静止を確認してから
+   降下・リリースして正確に空きスペースへ投入する。
 """
 
 from __future__ import annotations
@@ -24,17 +25,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from isaaclab.envs.mdp.actions.joint_actions import RelativeJointPositionAction
 from isaaclab.envs.mdp.actions.actions_cfg import RelativeJointPositionActionCfg
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.envs.mdp.actions.joint_actions import RelativeJointPositionAction
 from isaaclab.utils.configclass import configclass
-from isaaclab.utils.math import quat_apply_inverse
-from isaaclab_tasks.core.lift.mdp import body_state_b
 
 from .task import (
     BALL_LIFT_TARGET_HEIGHT,
     BALL_PLACE_APPROACH_HEIGHT,
     BOX_HEIGHT,
+    BOX_SIZE,
     ball_height,
     ball_is_holding,
     ball_radius,
@@ -54,70 +53,103 @@ SLOT_OFFSETS: dict[str, tuple[float, float]] = {
 }
 
 
-def ask_local_vlm_empty_slot(
+def _crop_and_annotate_box_image(
     rgb_tensor: torch.Tensor,
-    vlm_url: str = "http://localhost:11434/api/chat",
-    vlm_model: str = "qwen2.5vl:7b",
-) -> str:
-    """俯瞰カメラのRGB画像から、箱の中の空いているスロット名をローカルVLMに判定させる。"""
-    from PIL import Image
+    box_local_xy: tuple[float, float],
+    cam_pos: tuple[float, float, float] = (0.33, -0.10, 0.45),
+    focal_length: float = 18.0,
+    horizontal_aperture: float = 20.955,
+):
+    """俯瞰カメラ画像から箱の周辺だけを切り抜き、2x2の十字線と象限ラベルを描画したPIL画像を返す。"""
+    from PIL import Image, ImageDraw
 
     img_np = rgb_tensor[0, ..., :3].detach().cpu().numpy()
     if img_np.dtype != "uint8":
         img_np = (img_np.clip(0.0, 1.0) * 255).astype("uint8")
     pil_img = Image.fromarray(img_np)
+    w, h = pil_img.size
+
+    # カメラから箱の上面までの距離 [m] と 1m あたりのピクセル数
+    depth = max(cam_pos[2] - (0.035 + 0.5 * BOX_HEIGHT), 0.1)
+    fov_w_m = depth * (horizontal_aperture / focal_length)
+    px_per_m = w / fov_w_m
+
+    # 画像の右 = -Y、画像の上 = +X に対応
+    cx = w * 0.5 - (box_local_xy[1] - cam_pos[1]) * px_per_m
+    cy = h * 0.5 - (box_local_xy[0] - cam_pos[0]) * px_per_m
+    half_crop = max(int(0.5 * BOX_SIZE * 1.35 * px_per_m), 32)
+
+    left = max(0, int(cx - half_crop))
+    top = max(0, int(cy - half_crop))
+    right = min(w, int(cx + half_crop))
+    bottom = min(h, int(cy + half_crop))
+
+    cropped = pil_img.crop((left, top, right, bottom)).resize((256, 256), Image.Resampling.BILINEAR)
+    draw = ImageDraw.Draw(cropped)
+    # 箱の中心に2x2の区切り線と象限ラベルを描画（VLMの誤認・先頭バイアス防止）
+    draw.line([(128, 0), (128, 256)], fill=(255, 255, 0), width=2)
+    draw.line([(0, 128), (256, 128)], fill=(255, 255, 0), width=2)
+    draw.text((8, 8), "TL", fill=(255, 255, 0))
+    draw.text((228, 8), "TR", fill=(255, 255, 0))
+    draw.text((8, 236), "BL", fill=(255, 255, 0))
+    draw.text((228, 236), "BR", fill=(255, 255, 0))
+    return cropped
+
+
+def ask_local_vlm_empty_slot(
+    rgb_tensor: torch.Tensor,
+    box_local_xy: tuple[float, float] = (0.33, -0.10),
+    vlm_url: str = "http://localhost:11434/api/chat",
+    vlm_model: str = "qwen2.5vl:7b",
+) -> str:
+    """俯瞰カメラのRGB画像から箱を切り抜いてローカルVLMへ送り、空いているスロット名を判定させる。"""
+    pil_img = _crop_and_annotate_box_image(rgb_tensor, box_local_xy=box_local_xy)
+    try:
+        pil_img.save("/tmp/vlm_last_input.png")
+    except OSError:
+        pass
+
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG")
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
     prompt = (
-        "画像には四角い緑色の箱があり、中に4つの区画（2x2）があります。\n"
-        "現在3つの区画に青いボールが入っており、1つだけ空いています。\n"
-        "空いている区画を次の4つから1つだけ選び、JSONのみで答えてください:\n"
+        "画像は緑色の箱を真上から拡大し、黄色い十字線で4つの区画に区切ったものです。\n"
+        "左上=TL(top_left)、右上=TR(top_right)、左下=BL(bottom_left)、右下=BR(bottom_right)です。\n"
+        "現在3つの区画に青いボールが入っており、1つの区画だけボールが無く空いています。\n"
+        "青いボールが入っていない空いている区画を1つだけ選び、JSONのみで答えてください:\n"
         '{"empty_slot": "top_left" | "top_right" | "bottom_left" | "bottom_right"}'
     )
     payload = {
         "model": vlm_model,
         "messages": [{"role": "user", "content": prompt, "images": [img_b64]}],
         "stream": False,
+        "options": {"temperature": 0.0},
     }
     req = urllib.request.Request(
         vlm_url,
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=15) as resp:
         res_json = json.loads(resp.read().decode("utf-8"))
     content = res_json["message"]["content"]
     print(f"[VLM応答] {content}")
 
+    # 1. 厳密な JSON 形式を最優先で抽出
     match = re.search(r'"empty_slot"\s*:\s*"(top_left|top_right|bottom_left|bottom_right)"', content)
     if match:
         return match.group(1)
-    for key in SLOT_OFFSETS:
-        if key in content:
-            return key
+    # 2. JSON以外の文章で返った場合、先頭バイアスを避けるため最後に言及された結論を採用
+    matches = re.findall(r"\b(top_left|top_right|bottom_left|bottom_right)\b", content)
+    if matches:
+        return matches[-1]
+    # 3. 短縮ラベル（TL/TR/BL/BR）で返った場合のフォールバック
+    short_map = {"TL": "top_left", "TR": "top_right", "BL": "bottom_left", "BR": "bottom_right"}
+    short_matches = re.findall(r"\b(TL|TR|BL|BR)\b", content)
+    if short_matches:
+        return short_map[short_matches[-1]]
     raise ValueError(f"VLMの応答からスロット名を抽出できませんでした: {content}")
-
-
-def vlm_box_state_b(
-    env: ManagerBasedRLEnv,
-    body_asset_cfg: SceneEntityCfg,
-    base_asset_cfg: SceneEntityCfg,
-    nominal_box_pos: tuple[float, float, float] = (0.33, -0.10, 0.035),
-) -> torch.Tensor:
-    """強化学習ポリシーに渡す箱の観測。
-
-    実際の箱を逆方向や離れた位置に動かしてもポリシーが混乱してボールを掴めなくならないよう、
-    ポリシーには常に学習時の基準位置 ``nominal_box_pos`` をベース座標系で返す。
-    """
-    state = body_state_b(env, body_asset_cfg=body_asset_cfg, base_asset_cfg=base_asset_cfg).clone()
-    robot = env.scene[base_asset_cfg.name]
-    base_pos_w = robot.data.root_pos_w.torch
-    base_quat_w = robot.data.root_quat_w.torch
-    nominal_w = env.scene.env_origins + base_pos_w.new_tensor(nominal_box_pos)
-    state[:, :3] = quat_apply_inverse(base_quat_w, nominal_w - base_pos_w)
-    return state
 
 
 def _ensure_vlm_state(env: ManagerBasedRLEnv) -> None:
@@ -131,6 +163,7 @@ def _ensure_vlm_state(env: ManagerBasedRLEnv) -> None:
     env._so101_vlm_queried = torch.zeros(n, dtype=torch.bool, device=device)
     env._so101_vlm_drop_timer = torch.zeros(n, dtype=torch.long, device=device)
     env._so101_vlm_slot_offset = torch.zeros((n, 2), dtype=torch.float32, device=device)
+    env._so101_vlm_saved_wrist_roll = torch.full((n,), -0.8044, dtype=torch.float32, device=device)
     env._so101_vlm_q_above = torch.zeros((n, 5), dtype=torch.float32, device=device)
     env._so101_vlm_q_drop = torch.zeros((n, 5), dtype=torch.float32, device=device)
     env._so101_vlm_fk_table: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -142,9 +175,10 @@ def _calibrate_fk_table(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Ten
     device = env.device
     saved_q = robot.data.joint_pos.torch.clone()
 
-    pans = torch.linspace(-1.45, 1.45, 19, device=device)
-    lifts = torch.linspace(-0.30, 0.40, 6, device=device)
-    elbows = torch.linspace(-0.45, 0.20, 5, device=device)
+    # 通常スタートの可動域に合わせて shoulder_lift / elbow_flex を広めにカバーし、wrist_roll は基準値(-0.8044)を使用
+    pans = torch.linspace(-1.45, 1.45, 21, device=device)
+    lifts = torch.linspace(-0.65, 0.45, 8, device=device)
+    elbows = torch.linspace(-0.55, 0.35, 6, device=device)
     grid_pan, grid_lift, grid_elbow = torch.meshgrid(pans, lifts, elbows, indexing="ij")
     num_pts = grid_pan.numel()
 
@@ -152,8 +186,8 @@ def _calibrate_fk_table(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Ten
     q_candidates[:, 0] = grid_pan.reshape(-1)
     q_candidates[:, 1] = grid_lift.reshape(-1)
     q_candidates[:, 2] = grid_elbow.reshape(-1)
-    q_candidates[:, 3] = 1.20
-    q_candidates[:, 4] = -1.64
+    q_candidates[:, 3] = 1.25
+    q_candidates[:, 4] = -0.8044
     q_candidates[:, 5] = 0.0
 
     tcp_local = torch.zeros((num_pts, 3), device=device)
@@ -189,14 +223,13 @@ def _solve_arm_joints_from_table(
 
 
 def _update_vlm_transport_state(env: ManagerBasedRLEnv) -> None:
-    """毎ステップ把持・持ち上げ状態を監視し、持ち上げ完了時にVLM判定と目標関節角を計算する。"""
+    """開始直後のVLM空きスロット判定、および持ち上げ完了後の運搬・静止リリース状態を更新する。"""
     _ensure_vlm_state(env)
-    holding = ball_is_holding(env)
-    lifted_now = holding & (ball_height(env) >= BALL_PLACE_APPROACH_HEIGHT)
-    newly_active = lifted_now & ~env._so101_vlm_transport_active
-    env._so101_vlm_transport_active |= lifted_now
+    origins = env.scene.env_origins
+    box_local = env.scene["box"].data.root_pos_w.torch - origins
 
-    if newly_active.any() and not env._so101_vlm_queried.all():
+    # 1. エピソード開始直後（アームがまだホーム姿勢で箱を隠していない時）に全体カメラで空きスロットを把握・記憶する
+    if (env.episode_length_buf >= 1).any() and not env._so101_vlm_queried.all():
         vlm_mode = os.environ.get("SO101_VLM_MODE", "auto").lower()
         vlm_url = os.environ.get("SO101_VLM_URL", "http://localhost:11434/api/chat")
         vlm_model = os.environ.get("SO101_VLM_MODEL", "qwen2.5vl:7b")
@@ -210,11 +243,17 @@ def _update_vlm_transport_state(env: ManagerBasedRLEnv) -> None:
             try:
                 env.scene.sensors["overhead_camera"].update(dt=env.step_dt)
                 rgb = env.scene.sensors["overhead_camera"].data.output["rgb"].torch
-                slot_key = ask_local_vlm_empty_slot(rgb, vlm_url=vlm_url, vlm_model=vlm_model)
+                box_xy = (float(box_local[0, 0]), float(box_local[0, 1]))
+                slot_key = ask_local_vlm_empty_slot(
+                    rgb, box_local_xy=box_xy, vlm_url=vlm_url, vlm_model=vlm_model
+                )
                 dx, dy = SLOT_OFFSETS[slot_key]
                 env._so101_vlm_slot_offset[:, 0] = dx
                 env._so101_vlm_slot_offset[:, 1] = dy
-                print(f"[VLM制御] VLM判定スロット: {slot_key} -> offset=({dx:+.3f}, {dy:+.3f})")
+                print(
+                    f"[VLM制御] 開始時VLM判定スロット: {slot_key} -> offset=({dx:+.3f}, {dy:+.3f}) "
+                    f"(正解: ({float(default_offset[0, 0]):+.3f}, {float(default_offset[0, 1]):+.3f}))"
+                )
             except Exception as err:
                 print(
                     f"[VLM制御] ローカルVLM未接続のため環境の空きスロット座標を使用します "
@@ -222,15 +261,25 @@ def _update_vlm_transport_state(env: ManagerBasedRLEnv) -> None:
                 )
         else:
             print(
-                f"[VLM制御] 空きスロット座標へ運搬開始: "
+                f"[VLM制御] 空きスロット座標を記憶(モック): "
                 f"offset=({float(default_offset[0, 0]):+.3f}, {float(default_offset[0, 1]):+.3f})"
             )
 
         env._so101_vlm_queried[:] = True
 
+    # 2. ボールを把持して安全高さまで持ち上げたら、運搬制御へバトンタッチ（その瞬間の wrist_roll を保存して維持）
+    holding = ball_is_holding(env)
+    lifted_now = holding & (ball_height(env) >= BALL_PLACE_APPROACH_HEIGHT)
+    newly_active = lifted_now & ~env._so101_vlm_transport_active
+    if newly_active.any():
+        current_wrist_roll = env.scene["robot"].data.joint_pos.torch[:, 4]
+        env._so101_vlm_saved_wrist_roll = torch.where(
+            newly_active, current_wrist_roll, env._so101_vlm_saved_wrist_roll
+        )
+    env._so101_vlm_transport_active |= lifted_now
+
+    # 3. 運搬中: 目標スロットの上空・降下関節角を計算し、精密に位置合わせ＆静止してからリリースへ移行
     if env._so101_vlm_transport_active.any():
-        origins = env.scene.env_origins
-        box_local = env.scene["box"].data.root_pos_w.torch - origins
         target_xy_local = box_local[:, :2] + env._so101_vlm_slot_offset
 
         above_local = torch.zeros_like(box_local)
@@ -241,14 +290,21 @@ def _update_vlm_transport_state(env: ManagerBasedRLEnv) -> None:
         drop_local[:, :2] = target_xy_local
         drop_local[:, 2] = box_local[:, 2] + BOX_HEIGHT + ball_radius(env) + 0.005
 
-        env._so101_vlm_q_above = _solve_arm_joints_from_table(env, above_local)
-        env._so101_vlm_q_drop = _solve_arm_joints_from_table(env, drop_local)
+        q_above = _solve_arm_joints_from_table(env, above_local)
+        q_drop = _solve_arm_joints_from_table(env, drop_local)
+        # 運搬中に手首が急回転してボールが落ちないよう、持ち上げ時点の wrist_roll をそのまま維持する
+        q_above[:, 4] = env._so101_vlm_saved_wrist_roll
+        q_drop[:, 4] = env._so101_vlm_saved_wrist_roll
+        env._so101_vlm_q_above = q_above
+        env._so101_vlm_q_drop = q_drop
 
         tcp_local = grasp_center_w(env) - origins
         xy_dist = torch.linalg.vector_norm(tcp_local[:, :2] - target_xy_local, dim=-1)
-        aligned = env._so101_vlm_transport_active & (xy_dist < 0.025)
+        ball_xy_speed = torch.linalg.vector_norm(env.scene["ball"].data.root_lin_vel_w.torch[:, :2], dim=-1)
+        # 目標中心から 1.5cm 以内 かつ 水平速度が十分落ちて静止した状態で初めて降下・リリースタイマーを開始
+        aligned_and_calm = env._so101_vlm_transport_active & (xy_dist < 0.015) & (ball_xy_speed < 0.06)
         env._so101_vlm_drop_timer = torch.where(
-            aligned | (env._so101_vlm_drop_timer > 0),
+            aligned_and_calm | (env._so101_vlm_drop_timer > 0),
             env._so101_vlm_drop_timer + 1,
             env._so101_vlm_drop_timer,
         )
@@ -265,35 +321,35 @@ class VLMGuidedArmAction(RelativeJointPositionAction):
         self._env._so101_vlm_queried[ids] = False
         self._env._so101_vlm_drop_timer[ids] = 0
 
-    def process_action(self, actions: torch.Tensor) -> None:
+    def process_actions(self, actions: torch.Tensor) -> None:
         _update_vlm_transport_state(self._env)
         active = self._env._so101_vlm_transport_active
         if active.any():
             actions = actions.clone()
             current_q = self._asset.data.joint_pos.torch[:, self._joint_ids]
             timer = self._env._so101_vlm_drop_timer
-            # 空きスロット真上に到達後 1〜12 ステップは少し降ろし、12ステップ以降は少し上に逃がす
-            lowering = (timer >= 1) & (timer <= 12)
+            # 空きスロット真上で静止後、1〜16ステップかけてゆっくり降ろし、17ステップ以降は少し上へ逃がす
+            lowering = (timer >= 1) & (timer <= 16)
             target_q = torch.where(lowering.unsqueeze(-1), self._env._so101_vlm_q_drop, self._env._so101_vlm_q_above)
             scale = self._scale if isinstance(self._scale, float) else 0.033
-            guided_act = ((target_q - current_q) / scale).clamp(-0.85, 0.85)
+            guided_act = ((target_q - current_q) / scale).clamp(-0.75, 0.75)
             actions = torch.where(active.unsqueeze(-1), guided_act, actions)
-        super().process_action(actions)
+        super().process_actions(actions)
 
 
 class VLMGuidedGripperAction(RelativeJointPositionAction):
     """運搬中はグリッパーをしっかり閉じ続け、空きスロット真上に到達して降ろした後に開いて放す。"""
 
-    def process_action(self, actions: torch.Tensor) -> None:
+    def process_actions(self, actions: torch.Tensor) -> None:
         _ensure_vlm_state(self._env)
         active = self._env._so101_vlm_transport_active
         if active.any():
             actions = actions.clone()
             timer = self._env._so101_vlm_drop_timer
-            # 降下完了（timer > 10）したら +1.0（開く）、それまでの運搬中は -1.0（閉じて保持）
-            grip_cmd = torch.where(timer > 10, 1.0, -1.0).unsqueeze(-1)
+            # 降下完了（timer > 14）したら +1.0（開く）、それまでの運搬中は -1.0（閉じて保持）
+            grip_cmd = torch.where(timer > 14, 1.0, -1.0).unsqueeze(-1)
             actions = torch.where(active.unsqueeze(-1), grip_cmd, actions)
-        super().process_action(actions)
+        super().process_actions(actions)
 
 
 @configclass
