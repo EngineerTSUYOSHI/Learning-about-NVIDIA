@@ -22,7 +22,7 @@ from isaaclab_tasks.utils.presets import MultiBackendRendererCfg
 from isaaclab_tutorial.assets import BALL_USD
 from isaaclab_tutorial.tasks.place_vial import mdp
 
-from .env_cfg import ARM_JOINTS, BallSpawnCfg, SO101SceneCfg, SO101VialEnvCfg
+from .env_cfg import ARM_JOINTS, BallSpawnCfg, OpenBoxSpawnCfg, SO101SceneCfg, SO101VialEnvCfg
 
 
 def _overhead_renderer_cfg() -> MultiBackendRendererCfg:
@@ -37,6 +37,16 @@ def _overhead_renderer_cfg() -> MultiBackendRendererCfg:
 @configclass
 class SO101VLMSceneCfg(SO101SceneCfg):
     """箱内ボール3個と俯瞰カメラを追加したVLM検証用シーン設定。"""
+
+    # プリミティブ生成の上開き箱（12cm x 12cm x 高さ5cm、ロボットの少し右前に配置）
+    box = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Box",
+        spawn=OpenBoxSpawnCfg(size=0.12, height=0.05, wall_thickness=0.006),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(0.33, -0.10, 0.035),
+            rot=(0.0, 0.0, 0.0, 1.0),
+        ),
+    )
 
     # 箱の中に最初から入っている3個のボール（reset_ball_step1 で4スロットのうち3箇所へランダム配置される）
     box_ball_0 = RigidObjectCfg(
@@ -107,6 +117,13 @@ class SO101VialVLMEnvCfg(SO101VialEnvCfg):
 
     scene: SO101VLMSceneCfg = SO101VLMSceneCfg(num_envs=1, env_spacing=0.9, replicate_physics=True)
     actions: VLMActionsCfg = VLMActionsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # VLM検証タスクでは、把持＆リフトでリセットされず運搬・投入まで完遂できるよう、学習用の成功判定を無効化
+        self.terminations.success = None
+        # 把持・持ち上げ・水平移動・降下・リリース・退避まで完遂できるようエピソード長を30秒に設定
+        self.episode_length_s = 30.0
 
     def play_mode(self):
         super().play_mode()

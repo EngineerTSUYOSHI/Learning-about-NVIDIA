@@ -137,7 +137,8 @@ class ball_place_success(ManagerTermBase):
 
 
 def ball_dropped(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """一度持ち上げたボールが机（マット）の上まで落ちた場合に終了判定を返す。"""
+    """一度持ち上げたボールが箱の外の机（マット）の上まで落ちた場合に終了判定を返す。"""
     fallen = ball_height(env) < ball_lift_min_height(env)
     progress = ball_place_progress(env)
-    return progress.lifted & fallen
+    in_box = ball_in_box(env) if "box" in env.scene.keys() else torch.zeros_like(fallen)
+    return progress.lifted & fallen & ~in_box

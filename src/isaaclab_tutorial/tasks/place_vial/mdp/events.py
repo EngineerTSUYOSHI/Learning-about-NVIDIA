@@ -190,6 +190,7 @@ class reset_ball_step1(ManagerTermBase):
         from .task import (
             BALL_LIFT_TARGET_HEIGHT,
             ball_lift_min_height,
+            ball_pick_target_height,
             ball_radius,
             ball_rest_height,
             fingertip_positions_w,
@@ -257,7 +258,7 @@ class reset_ball_step1(ManagerTermBase):
                 self.grip_table = self._calibrate_grip_table(env, ids)
 
             # 机直上の把持ポーズ〜持ち上げ序盤ポーズの間をランダム補間し、少し関節ノイズを加える
-            blend = torch.empty((n, 1), device=env.device).uniform_(0.0, 0.35)
+            blend = torch.empty((n, 1), device=env.device).uniform_(0.0, 0.20)
             grasp_pose = torch.lerp(self.grasp_joint_pos.unsqueeze(0), self.lift_mid_joint_pos.unsqueeze(0), blend)
             noise = torch.zeros_like(grasp_pose)
             noise[:, 0].uniform_(-0.40, 0.40)  # shoulder_pan（ボール出現側にも届くよう広めに設定）
@@ -278,9 +279,10 @@ class reset_ball_step1(ManagerTermBase):
             center_xy = jaw_center_w[:, :2] - origins[:, :2]
             center_z = jaw_center_w[:, 2] - origins[:, 2]
             desk_top = 0.035 + h
+            target_pick_h = ball_pick_target_height(env)[ids]
             valid = (
                 (center_z >= min_lift_h + 0.002)
-                & (center_z <= BALL_LIFT_TARGET_HEIGHT - 0.01)
+                & (center_z <= target_pick_h - 0.010)
                 & (lowest_tip >= desk_top + 0.002)
             )
             if box_xy_local is not None:

@@ -61,15 +61,17 @@ def lift_progress(
 ) -> torch.Tensor:
     """爪の間でボールを挟んだ状態（``pinch_bonus``）から、目標持ち上げ高さまで持ち上げる密な報酬。
 
-    Ver4では、静止高さ+4cmまで持ち上げて把持が安定するまで加点する。
+    目標高さに到達（``lifted``）した後は、目標手前でのホバリング局所解を防ぐため加点を停止する。
     """
+    progress_state = ball_place_progress(env)
     in_jaws = ball_in_jaws(env)
     holding = ball_is_holding(env)
     target = ball_pick_target_height(env) if target_height is None else torch.full((env.num_envs,), target_height, device=env.device)
     max_travel = (target - ball_rest_height(env)).clamp_min(0.01)
     height_ratio = (ball_lift_height_progress(env) / max_travel).clamp(0.0, 1.0)
     lift_score = pinch_bonus + (1.0 - pinch_bonus) * height_ratio
-    return torch.where(holding, lift_score, torch.where(in_jaws, pinch_bonus, 0.0))
+    raw = torch.where(holding, lift_score, torch.where(in_jaws, pinch_bonus, 0.0))
+    return torch.where(progress_state.lifted, 0.0, raw)
 
 
 def place_goal(env: ManagerBasedRLEnv, std: float = 0.20) -> torch.Tensor:

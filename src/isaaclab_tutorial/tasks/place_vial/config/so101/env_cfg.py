@@ -586,17 +586,6 @@ class SO101SceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # プリミティブ生成の上開き箱（12cm x 12cm x 高さ5cm、ロボットの少し右前に配置）
-    box = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Box",
-        spawn=OpenBoxSpawnCfg(size=0.12, height=0.05, wall_thickness=0.006),
-        init_state=RigidObjectCfg.InitialStateCfg(
-            # ロボットの少し右前に配置（実際の各エピソード位置は reset_ball でランダム決定）
-            pos=(0.33, -0.10, 0.035),
-            rot=(0.0, 0.0, 0.0, 1.0),
-        ),
-    )
-
     desk = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Desk",
         spawn=sim_utils.UsdFileCfg(usd_path=str(DESK_USD), func=_spawn_usd_with_contact_material),
@@ -831,13 +820,13 @@ class RewardsCfg:
         func=mdp.approach_progress, weight=1.0, params={"height_offset": 0.0}
     )
     # 持ち上げシェーピング報酬: ボールを浮かせている間、目標持ち上げ高さ（+4cm）に近づくほど加点
-    lift_progress = RewTerm(func=mdp.lift_progress, weight=0.5, params={"pinch_bonus": 0.1})
+    lift_progress = RewTerm(func=mdp.lift_progress, weight=0.3, params={"pinch_bonus": 0.1})
     # マイルストーン報酬: 把持(+10.0), リフト(+20.0) の1回限りボーナス
     milestones = RewTerm(
         func=mdp.milestones, weight=1.0, params={"grasp_bonus": 10.0, "lift_bonus": 20.0}
     )
-    # 完了ボーナス: 目標高さまで持ち上げて安定保持できた時の成功報酬
-    success = RewTerm(func=mdp.success, weight=100.0)
+    # 完了ボーナス: 目標高さまで持ち上げて安定保持できた時の成功報酬（手前ホバリング局所解を防ぐため200に設定）
+    success = RewTerm(func=mdp.success, weight=200.0)
     ball_lost = RewTerm(
         func=mdp.is_terminated_term, weight=-50.0, params={"term_keys": ["ball_out_of_bounds", "ball_dropped"]}
     )

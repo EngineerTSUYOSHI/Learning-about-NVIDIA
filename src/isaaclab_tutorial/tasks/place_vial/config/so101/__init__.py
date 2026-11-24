@@ -15,6 +15,18 @@ gym.register(
     },
 )
 
+# ボール把持タスク用エイリアス（IsaacTutorial-Place-Ball-SO101 でも同一タスクを実行可能に）
+gym.register(
+    id="IsaacTutorial-Place-Ball-SO101",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{_PACKAGE}.env_cfg:SO101VialEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{_PACKAGE}.agents.rsl_rl_ppo_cfg:SO101StatePPORunnerCfg",
+        "default_agent": "rsl_rl",
+    },
+)
+
 gym.register(
     id="IsaacTutorial-Place-Vial-SO101-Camera",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
