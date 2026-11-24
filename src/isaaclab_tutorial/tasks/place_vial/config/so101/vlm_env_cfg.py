@@ -120,8 +120,8 @@ class SO101VialVLMEnvCfg(SO101VialEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        # VLM検証タスクでは、把持＆リフトでリセットされず運搬・投入まで完遂できるよう、学習用の成功判定を無効化
-        self.terminations.success = None
+        # VLM検証タスクでは、進捗更新（grasped/lifted）を維持しつつ運搬・投入まで完遂できるよう terminate=False に設定
+        self.terminations.success.params = {"terminate": False}
         # 把持・持ち上げ・水平移動・降下・リリース・退避まで完遂できるようエピソード長を30秒に設定
         self.episode_length_s = 30.0
 

@@ -49,7 +49,7 @@ class ball_lift_success(ManagerTermBase):
             self.progress.grasp_count[ids] = torch.where(grasped, self.progress.grasp_steps, 0)
             self.progress.lifted[ids] = self._env._so101_reset_lifted[ids]
 
-    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+    def __call__(self, env: ManagerBasedRLEnv, terminate: bool = True) -> torch.Tensor:
         holding = ball_is_holding(env)  # 両爪でボールを挟み、机から浮かせているか
         lifted = holding & (ball_height(env) >= ball_pick_target_height(env))  # 目標高さ（+4cm）に達したか
 
@@ -59,6 +59,8 @@ class ball_lift_success(ManagerTermBase):
         log["Metrics/grasp_rate"] = self.progress.grasped.float().mean()
         log["Metrics/lift_rate"] = self.progress.lifted.float().mean()
         log["Metrics/success_rate"] = success.float().mean()
+        if hasattr(env, "_so101_reset_grasp_start"):
+            log["Metrics/grasp_start_rate"] = env._so101_reset_grasp_start.float().mean()
         if "fixed_jaw_support" in env.scene.sensors:
             support_force = torch.maximum(
                 contact_force(env, "fixed_jaw_support"), contact_force(env, "moving_jaw_support")
@@ -70,6 +72,8 @@ class ball_lift_success(ManagerTermBase):
             env._so101_terminal_support_contact_time = self.support_contact_time.clone()
 
         env._so101_terminal_time_to_success_s = self.progress.time_to_success.float() * env.step_dt
+        if not terminate:
+            return torch.zeros_like(success)
         return success
 
 
@@ -94,6 +98,8 @@ class ball_place_success(ManagerTermBase):
             self.progress.lifted[ids] = self._env._so101_reset_lifted[ids]
 
     def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+        if "box" not in env.scene.keys():  # noqa: SIM118
+            return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
         holding = ball_is_holding(env)  # 両爪でボールを挟み、机から浮かせているか
         lifted_to_target = holding & (ball_height(env) >= BALL_LIFT_TARGET_HEIGHT)  # 箱の壁を越える高さに達したか
 

@@ -350,17 +350,16 @@ def _update_vlm_transport_state(env: ManagerBasedRLEnv) -> None:
             env._so101_vlm_phase_timer = torch.where(aligned_and_calm, torch.tensor(0, device=env.device), env._so101_vlm_phase_timer)
             print(f"[3層連携] 空きスロット真上到達＆静止 -> 垂直降下フェーズへ移行")
 
-    # Phase 3: 垂直降下（箱の中の底板付近 drop_z へゆっくり降ろす）
+    # Phase 3: 垂直降下（箱の縁付近 drop_z へ降ろす。爪が隣のボールに挟まれないよう縁の少し下で留める）
     in_phase3 = phase == 3
     if in_phase3.any():
-        from .task import BOX_WALL_THICKNESS
-        drop_z = box_local[:, 2] + BOX_WALL_THICKNESS + ball_radius(env) + 0.010
+        drop_z = box_local[:, 2] + BOX_HEIGHT - 0.25 * ball_radius(env)
         q_drop = move_arm_drop_joints(env, target_xy_local, drop_z, env._so101_vlm_saved_wrist_roll)
         env._so101_vlm_target_q = torch.where(in_phase3.unsqueeze(-1), q_drop, env._so101_vlm_target_q)
         env._so101_vlm_phase_timer = torch.where(in_phase3, env._so101_vlm_phase_timer + 1, env._so101_vlm_phase_timer)
-        # 爪先端高さが降下目標付近（+1.5cm以内）に到達、または最大30ステップ経過でリリースへ
+        # 爪先端高さが降下目標付近（+1.5cm以内）に到達、または最大20ステップ経過でリリースへ
         z_reached = tcp_local[:, 2] <= (drop_z + 0.015)
-        dropped_ready = in_phase3 & (z_reached | (env._so101_vlm_phase_timer >= 30))
+        dropped_ready = in_phase3 & (z_reached | (env._so101_vlm_phase_timer >= 20))
         if dropped_ready.any():
             env._so101_vlm_phase = torch.where(dropped_ready, torch.tensor(4, device=env.device), env._so101_vlm_phase)
             env._so101_vlm_phase_timer = torch.where(dropped_ready, torch.tensor(0, device=env.device), env._so101_vlm_phase_timer)

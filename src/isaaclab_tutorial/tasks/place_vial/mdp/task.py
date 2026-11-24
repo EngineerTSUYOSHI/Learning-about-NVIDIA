@@ -145,14 +145,18 @@ def ball_lift_height_progress(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def box_target_pos_w(env: ManagerBasedRLEnv, height_above_floor: float = 0.045) -> torch.Tensor:
-    """箱の中心上空の目標位置（ワールド座標系 [m]）を返す。"""
+    """（旧互換・VLM環境用）箱の中心上空の目標位置（ワールド座標系 [m]）を返す。箱が無い場合はゼロを返す。"""
+    if "box" not in env.scene.keys():  # noqa: SIM118
+        return torch.zeros((env.num_envs, 3), device=env.device)
     box_pos = env.scene["box"].data.root_pos_w.torch.clone()
     box_pos[:, 2] += BOX_WALL_THICKNESS + height_above_floor
     return box_pos
 
 
 def ball_in_box(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """各環境のボールサイズに応じて、ボールが箱の内側（底の上〜壁の高さ以内）に入っている場合に True を返す。"""
+    """各環境のボールサイズに応じて、ボールが箱の内側に入っている場合に True を返す（箱が無い環境では常に False）。"""
+    if "box" not in env.scene.keys():  # noqa: SIM118
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     ball_pos = env.scene["ball"].data.root_pos_w.torch
     box_pos = env.scene["box"].data.root_pos_w.torch
     rel = ball_pos - box_pos

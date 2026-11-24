@@ -75,12 +75,9 @@ def lift_progress(
 
 
 def place_goal(env: ManagerBasedRLEnv, std: float = 0.20) -> torch.Tensor:
-    """安全高さまで持ち上げた後、壁を越えて箱の上空→箱の内側へ誘導し、リリースを促す報酬。
-
-    1. 目標高さ（``lifted``）または保持したまま高さ ``0.10m`` 以上に達してから発動し、壁への衝突を防ぐ。
-    2. 箱のXY範囲に入るまでは壁上空の高さ（``BALL_LIFT_TARGET_HEIGHT``）を維持させ、壁の角への衝突を防ぐ。
-    3. 箱のXY範囲に入ったら箱の底付近へ降ろし、指を開く（``gripper_openness``）ことで投入完了を促す。
-    """
+    """（旧互換用・Ver4 Pickタスクでは未使用）箱への誘導報酬。箱が無いシーンでは常にゼロを返す。"""
+    if "box" not in env.scene.keys():  # noqa: SIM118
+        return torch.zeros(env.num_envs, device=env.device)
     progress_state = ball_place_progress(env)
     holding = ball_is_holding(env)
     # 箱の中で指を開いた直後も報酬が切れないよう lifted も条件に含め、placed 完了まで維持する
