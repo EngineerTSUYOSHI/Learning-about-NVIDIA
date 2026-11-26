@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import os
 import re
 import urllib.request
@@ -153,17 +154,38 @@ def ask_local_vlm_empty_slot(
     raise ValueError(f"VLMの応答からスロット名を抽出できませんでした: {content}")
 
 
+SO101_ALL_JOINTS: tuple[str, ...] = (
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+)
+
+# 等速軌道追従パラメータ（重力＋クーロン静止摩擦によるストールを防ぎつつ滑らかに動かす）
+_TRAJ_MAX_STEP_RAD: float = 0.04
+_TRAJ_MAX_LEAD_RAD: float = 0.20
+
+
 def compute_safe_lift_z(env: ManagerBasedRLEnv, box_height: float = BOX_HEIGHT, margin: float = 0.025) -> torch.Tensor:
     """AI/幾何計算: 机高さ(0.035) + 箱の壁の高さ + ボール半径 + 安全マージンから必要持ち上げ高さを動的算出する。"""
     r = ball_radius(env)
     return 0.035 + box_height + r + margin
 
 
-def move_arm_vertical_joints(env: ManagerBasedRLEnv, lift_z: torch.Tensor, wrist_roll: torch.Tensor) -> torch.Tensor:
-    """現在のXY座標を保ったまま、指定された高さ lift_z まで真上に垂直上昇する5関節角度を算出する。"""
-    origins = env.scene.env_origins
-    tcp_local = grasp_center_w(env) - origins
-    target_xyz = tcp_local.clone()
+def move_arm_vertical_joints(
+    env: ManagerBasedRLEnv,
+    lift_z: torch.Tensor,
+    wrist_roll: torch.Tensor,
+    lift_xy_local: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """把持開始時のXY座標を保ったまま、指定された高さ lift_z まで真上に垂直上昇する5関節角度を算出する。"""
+    if lift_xy_local is None:
+        origins = env.scene.env_origins
+        lift_xy_local = (grasp_center_w(env) - origins)[:, :2]
+    target_xyz = torch.zeros((env.num_envs, 3), device=env.device)
+    target_xyz[:, :2] = lift_xy_local
     target_xyz[:, 2] = lift_z
     q = _solve_arm_joints_from_table(env, target_xyz)
     q[:, 4] = wrist_roll
@@ -200,37 +222,51 @@ def _ensure_vlm_state(env: ManagerBasedRLEnv) -> None:
         return
     n = env.num_envs
     device = env.device
+    robot = env.scene["robot"]
+    arm_joint_ids, _ = robot.find_joints(list(SO101_ALL_JOINTS[:5]), preserve_order=True)
+    all_joint_ids, _ = robot.find_joints(list(SO101_ALL_JOINTS), preserve_order=True)
+
     env._so101_vlm_initialized = True
+    env._so101_vlm_arm_joint_ids = arm_joint_ids
+    env._so101_vlm_all_joint_ids = all_joint_ids
     # phase: 0=RL_PICK, 1=LIFT_VERTICAL, 2=MOVE_HORIZONTAL, 3=DROP_VERTICAL, 4=RELEASE, 5=RETRACT
     env._so101_vlm_phase = torch.zeros(n, dtype=torch.long, device=device)
     env._so101_vlm_phase_timer = torch.zeros(n, dtype=torch.long, device=device)
     env._so101_vlm_queried = torch.zeros(n, dtype=torch.bool, device=device)
     env._so101_vlm_slot_offset = torch.zeros((n, 2), dtype=torch.float32, device=device)
+    env._so101_vlm_saved_lift_xy = torch.zeros((n, 2), dtype=torch.float32, device=device)
     env._so101_vlm_saved_wrist_roll = torch.full((n,), -0.8044, dtype=torch.float32, device=device)
     env._so101_vlm_target_q = torch.zeros((n, 5), dtype=torch.float32, device=device)
+    env._so101_vlm_cmd_q = torch.zeros((n, 5), dtype=torch.float32, device=device)
     env._so101_vlm_fk_table: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 def _calibrate_fk_table(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Tensor]:
-    """机全域（左右両方）をカバーする5関節角度と両爪中心ローカル座標(XYZ)の対応テーブルをFKで構築する。"""
+    """机全域（手前高所〜箱奥スロット・降下高さまで）をカバーする5関節角度と両爪中心ローカル座標(XYZ)の対応テーブルをFKで構築する。"""
     robot = env.scene["robot"]
     device = env.device
     saved_q = robot.data.joint_pos.torch.clone()
+    all_joint_ids = env._so101_vlm_all_joint_ids
 
-    # 通常スタートの可動域に合わせて shoulder_lift / elbow_flex を広めにカバーし、wrist_roll は基準値(-0.8044)を使用
-    pans = torch.linspace(-1.45, 1.45, 21, device=device)
-    lifts = torch.linspace(-0.65, 0.45, 8, device=device)
-    elbows = torch.linspace(-0.55, 0.35, 6, device=device)
+    # 前方の箱奥スロット(R≈0.29m)への運搬・降下まで網羅するよう lift / elbow の範囲と密度を拡大
+    pans = torch.linspace(-1.45, 1.45, 25, device=device)
+    lifts = torch.linspace(-0.75, 1.05, 16, device=device)
+    elbows = torch.linspace(-1.15, 0.55, 14, device=device)
     grid_pan, grid_lift, grid_elbow = torch.meshgrid(pans, lifts, elbows, indexing="ij")
     num_pts = grid_pan.numel()
 
-    q_candidates = torch.zeros((num_pts, 6), device=device)
-    q_candidates[:, 0] = grid_pan.reshape(-1)
-    q_candidates[:, 1] = grid_lift.reshape(-1)
-    q_candidates[:, 2] = grid_elbow.reshape(-1)
-    q_candidates[:, 3] = 1.25
-    q_candidates[:, 4] = -0.8044
-    q_candidates[:, 5] = 0.0
+    # SO101_ALL_JOINTS の名前順に関節角を構築し、all_joint_ids でロボットの関節順へ正確にマッピングする
+    q_ordered = torch.zeros((num_pts, 6), device=device)
+    q_ordered[:, 0] = grid_pan.reshape(-1)
+    q_ordered[:, 1] = grid_lift.reshape(-1)
+    q_ordered[:, 2] = grid_elbow.reshape(-1)
+    q_ordered[:, 3] = 1.15
+    q_ordered[:, 4] = -0.8044
+    # 直径5cmボール把持時の開き角（約18度）に合わせて爪先パッド中点を計測する
+    q_ordered[:, 5] = math.radians(18.0)
+
+    q_sim = torch.zeros_like(q_ordered)
+    q_sim[:, all_joint_ids] = q_ordered
 
     tcp_local = torch.zeros((num_pts, 3), device=device)
     n = env.num_envs
@@ -238,7 +274,7 @@ def _calibrate_fk_table(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Ten
     origins = env.scene.env_origins
 
     for start in range(0, num_pts, n):
-        chunk = q_candidates[start : start + n]
+        chunk = q_sim[start : start + n]
         k = len(chunk)
         robot.write_joint_position_to_sim_index(position=chunk, env_ids=all_ids[:k])
         env.sim.forward()
@@ -247,8 +283,16 @@ def _calibrate_fk_table(env: ManagerBasedRLEnv) -> tuple[torch.Tensor, torch.Ten
 
     robot.write_joint_position_to_sim_index(position=saved_q, env_ids=all_ids)
     env.sim.forward()
-    print(f"[VLM制御] アームFKテーブル構築完了 ({num_pts} サンプル)")
-    return q_candidates[:, :5], tcp_local
+
+    # 机面より下にめり込む無効な姿勢を除外する
+    valid_mask = tcp_local[:, 2] >= 0.030
+    q_valid = q_ordered[valid_mask, :5]
+    tcp_valid = tcp_local[valid_mask]
+    print(
+        f"[VLM制御] アームFKテーブル構築完了 "
+        f"(有効 {len(q_valid)}/{num_pts} サンプル, Z範囲: {float(tcp_valid[:, 2].min()):.3f}〜{float(tcp_valid[:, 2].max()):.3f}m)"
+    )
+    return q_valid, tcp_valid
 
 
 def _solve_arm_joints_from_table(
@@ -260,7 +304,7 @@ def _solve_arm_joints_from_table(
     q_table, tcp_table = env._so101_vlm_fk_table
     dists = torch.linalg.vector_norm(tcp_table.unsqueeze(0) - target_local_xyz.unsqueeze(1), dim=-1)
     top_d, top_i = dists.topk(4, largest=False, dim=-1)
-    weights = (-top_d / 0.015).softmax(dim=-1)
+    weights = (-top_d / 0.012).softmax(dim=-1)
     return (q_table[top_i] * weights.unsqueeze(-1)).sum(dim=1)
 
 
@@ -269,6 +313,10 @@ def _update_vlm_transport_state(env: ManagerBasedRLEnv) -> None:
     _ensure_vlm_state(env)
     origins = env.scene.env_origins
     box_local = env.scene["box"].data.root_pos_w.torch - origins
+
+    # 0. 把持中の接触状態を乱さないよう、アームがホーム姿勢にある開始時点でFKテーブルを事前構築しておく
+    if env._so101_vlm_fk_table is None:
+        env._so101_vlm_fk_table = _calibrate_fk_table(env)
 
     # 1. エピソード開始直後（アームがまだホーム姿勢で箱を隠していない時）に全体カメラで空きスロットを把握・記憶する
     if (env.episode_length_buf >= 1).any() and not env._so101_vlm_queried.all():
@@ -315,7 +363,9 @@ def _update_vlm_transport_state(env: ManagerBasedRLEnv) -> None:
     lift_z = compute_safe_lift_z(env)
     target_xy_local = box_local[:, :2] + env._so101_vlm_slot_offset
     tcp_local = grasp_center_w(env) - origins
-    current_wrist_roll = env.scene["robot"].data.joint_pos.torch[:, 4]
+    arm_joint_ids = env._so101_vlm_arm_joint_ids
+    current_arm_q = env.scene["robot"].data.joint_pos.torch[:, arm_joint_ids]
+    current_wrist_roll = current_arm_q[:, 4]
 
     # Phase 0: RLモデルによる把持＆浮上中 -> 机から浮上＆把持確認でPhase 1（垂直上昇）へ移行
     newly_grasped = (phase == 0) & holding & (ball_height(env) >= (ball_lift_min_height(env) + 0.008))
@@ -323,20 +373,39 @@ def _update_vlm_transport_state(env: ManagerBasedRLEnv) -> None:
         env._so101_vlm_saved_wrist_roll = torch.where(
             newly_grasped, current_wrist_roll, env._so101_vlm_saved_wrist_roll
         )
+        # 上昇中に円弧運動で目標XYがドリフトしないよう、把持完了時点のXYを固定保存する
+        env._so101_vlm_saved_lift_xy = torch.where(
+            newly_grasped.unsqueeze(-1), tcp_local[:, :2], env._so101_vlm_saved_lift_xy
+        )
+        # 等速軌道追従の初期指令角を現在の実測角に合わせる
+        env._so101_vlm_cmd_q = torch.where(
+            newly_grasped.unsqueeze(-1), current_arm_q, env._so101_vlm_cmd_q
+        )
         env._so101_vlm_phase = torch.where(newly_grasped, torch.tensor(1, device=env.device), env._so101_vlm_phase)
         env._so101_vlm_phase_timer = torch.where(newly_grasped, torch.tensor(0, device=env.device), env._so101_vlm_phase_timer)
+        # 同じステップ内で直ちに Phase 1 の目標角を計算できるよう phase を再取得する（ゼロ指令防止）
+        phase = env._so101_vlm_phase
         print(f"[3層連携] 把持完了を検知 -> プログラム垂直持ち上げフェーズへ移行 (lift_z={float(lift_z[0]):.3f}m)")
 
-    # Phase 1: 垂直上昇（真上に lift_z まで持ち上げる）
+    # Phase 1: 垂直上昇（固定した把持XYのまま真上に lift_z まで持ち上げる）
     in_phase1 = phase == 1
     if in_phase1.any():
-        q_lift = move_arm_vertical_joints(env, lift_z, env._so101_vlm_saved_wrist_roll)
+        q_lift = move_arm_vertical_joints(
+            env, lift_z, env._so101_vlm_saved_wrist_roll, lift_xy_local=env._so101_vlm_saved_lift_xy
+        )
         env._so101_vlm_target_q = torch.where(in_phase1.unsqueeze(-1), q_lift, env._so101_vlm_target_q)
-        lift_reached = in_phase1 & (tcp_local[:, 2] >= (lift_z - 0.015))
+        joint_err = (q_lift - current_arm_q).abs().amax(dim=-1)
+        # TCP高さが目標-1.5cmに達するか、関節角が十分収束しつつ壁越え安全高さ(-2.5cm)に達したら水平移動へ
+        lift_reached = in_phase1 & (
+            (tcp_local[:, 2] >= (lift_z - 0.015))
+            | ((joint_err < 0.035) & (tcp_local[:, 2] >= (lift_z - 0.025)))
+        )
         if lift_reached.any():
             env._so101_vlm_phase = torch.where(lift_reached, torch.tensor(2, device=env.device), env._so101_vlm_phase)
             env._so101_vlm_phase_timer = torch.where(lift_reached, torch.tensor(0, device=env.device), env._so101_vlm_phase_timer)
-            print(f"[3層連携] 垂直持ち上げ完了 -> 空きスロット水平移動フェーズへ移行")
+            print(
+                f"[3層連携] 垂直持ち上げ完了 (tcp_z={float(tcp_local[0, 2]):.3f}m) -> 空きスロット水平移動フェーズへ移行"
+            )
 
     # Phase 2: 水平移動（lift_z を維持したまま空きスロット直上へ運搬）
     in_phase2 = phase == 2
@@ -384,7 +453,7 @@ def _update_vlm_transport_state(env: ManagerBasedRLEnv) -> None:
 
 
 class VLMGuidedArmAction(RelativeJointPositionAction):
-    """把持まではRLポリシーの行動を実行し、把持後は決定論的移動メソッド（縦・横・降下・退避）で制御する。"""
+    """把持まではRLポリシーの行動を実行し、把持後は等速軌道追従（縦・横・降下・退避）でストールなく制御する。"""
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         super().reset(env_ids)
@@ -393,6 +462,7 @@ class VLMGuidedArmAction(RelativeJointPositionAction):
         self._env._so101_vlm_phase[ids] = 0
         self._env._so101_vlm_phase_timer[ids] = 0
         self._env._so101_vlm_queried[ids] = False
+        self._env._so101_vlm_cmd_q[ids] = self._asset.data.joint_pos.torch[ids][:, self._joint_ids]
 
     def process_actions(self, actions: torch.Tensor) -> None:
         _update_vlm_transport_state(self._env)
@@ -401,10 +471,29 @@ class VLMGuidedArmAction(RelativeJointPositionAction):
             actions = actions.clone()
             current_q = self._asset.data.joint_pos.torch[:, self._joint_ids]
             target_q = self._env._so101_vlm_target_q
-            scale = self._scale if isinstance(self._scale, float) else 0.033
-            guided_act = ((target_q - current_q) / scale).clamp(-0.75, 0.75)
+            cmd_q = self._env._so101_vlm_cmd_q
+
+            # 内部目標角 cmd_q を target_q へ一定速度で進め、重力＋静止摩擦に負けない先行角（最大0.20 rad）を確保する
+            step_delta = (target_q - cmd_q).clamp(-_TRAJ_MAX_STEP_RAD, _TRAJ_MAX_STEP_RAD)
+            next_cmd_q = (cmd_q + step_delta).clamp(current_q - _TRAJ_MAX_LEAD_RAD, current_q + _TRAJ_MAX_LEAD_RAD)
+            self._env._so101_vlm_cmd_q = torch.where(active.unsqueeze(-1), next_cmd_q, current_q)
+
+            guided_act = (self._env._so101_vlm_cmd_q - current_q) / self._scale
             actions = torch.where(active.unsqueeze(-1), guided_act, actions)
         super().process_actions(actions)
+
+    def apply_actions(self) -> None:
+        super().apply_actions()
+        _ensure_vlm_state(self._env)
+        active = self._env._so101_vlm_phase >= 1
+        if active.any():
+            env_ids = active.nonzero(as_tuple=False).squeeze(-1)
+            joint_ids = None if self._joint_ids == slice(None) else self._joint_ids
+            self._asset.set_joint_position_target_index(
+                target=self._env._so101_vlm_cmd_q[env_ids],
+                joint_ids=joint_ids,
+                env_ids=env_ids,
+            )
 
 
 class VLMGuidedGripperAction(RelativeJointPositionAction):
