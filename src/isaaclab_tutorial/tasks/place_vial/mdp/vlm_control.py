@@ -36,6 +36,7 @@ from .task import (
     BOX_SIZE,
     ball_height,
     ball_is_holding,
+    ball_lift_min_height,
     ball_radius,
     grasp_center_w,
 )

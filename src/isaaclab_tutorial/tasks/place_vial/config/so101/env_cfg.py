@@ -820,7 +820,7 @@ class RewardsCfg:
         func=mdp.approach_progress, weight=1.0, params={"height_offset": 0.0}
     )
     # 持ち上げシェーピング報酬: ボールを浮かせている間、目標持ち上げ高さ（+4cm）に近づくほど加点
-    lift_progress = RewTerm(func=mdp.lift_progress, weight=0.3, params={"pinch_bonus": 0.1})
+    lift_progress = RewTerm(func=mdp.lift_progress, weight=0.5, params={"pinch_bonus": 0.1})
     # マイルストーン報酬: 把持(+10.0), リフト(+20.0) の1回限りボーナス
     milestones = RewTerm(
         func=mdp.milestones, weight=1.0, params={"grasp_bonus": 10.0, "lift_bonus": 20.0}

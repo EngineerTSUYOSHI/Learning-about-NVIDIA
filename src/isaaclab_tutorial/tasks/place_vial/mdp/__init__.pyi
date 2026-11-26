@@ -12,6 +12,7 @@ __all__ = [
     "approach_progress",
     "ask_local_vlm_empty_slot",
     "ball_dropped",
+    "ball_lift_success",
     "ball_place_success",
     "encoder_joint_pos",
     "encoder_joint_target",
@@ -61,7 +62,7 @@ from .task import (
     BOX_SIZE,
     BOX_WALL_THICKNESS,
 )
-from .terminations import ball_dropped, ball_place_success
+from .terminations import ball_dropped, ball_lift_success, ball_place_success
 from .vlm_control import (
     SLOT_OFFSETS,
     VLMGuidedArmActionCfg,
